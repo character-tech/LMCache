@@ -31,4 +31,3 @@ steps:
 options:
   pool:
     name: 'projects/character-ai/locations/us-central1/workerPools/lmcache-amd-pool'
-  diskSizeGb: 300
