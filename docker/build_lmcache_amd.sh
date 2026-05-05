@@ -35,4 +35,5 @@ gcloud builds submit \
   --config=docker/cloudbuild.yaml \
   --substitutions="SHORT_SHA=$SHORT_SHA" \
   --project="$PROJECT" \
+  --region="$REGION" \
   .
