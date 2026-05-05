@@ -141,6 +141,83 @@ docker run --runtime nvidia --gpus all \
 
 ---
 
+### 4. `Dockerfile.amd` - AMD GPU Standalone (MI325X / MI350)
+
+**Image**: `gcr.io/character-ai/lmcache/lmcache-amd:<sha>`
+
+**Description**: Standalone LMCache server image for AMD GPUs. Builds the
+LMCache HIP extension (`rocm_extension` in `setup.py`) as a fat binary
+covering both `gfx942` (MI325X) and `gfx950` (MI350). Used by the
+LMCache operator's DaemonSet for MP-mode deployments. The vLLM
+container does NOT need LMCache compiled in for MP mode — it talks to
+this server over HIP IPC via `LMCacheMPConnector`.
+
+**Features**:
+- ✅ LMCache built from source with `BUILD_WITH_HIP=1`
+- ✅ Fat binary: one image runs on MI325X (gfx942) and MI350 (gfx950)
+- ✅ ROCm 7.2.3, PyTorch 2.10, Python 3.12 (from `rocm/pytorch` base)
+- ✅ Cross-compiled AOT via `hipcc` — no AMD GPU needed at build time
+
+**Build via Cloud Build (recommended)**:
+
+Cloud Build's stock pool only supports Intel hosts. To build on AMD
+EPYC hardware (matching the runtime CPU architecture), we use a
+**transient private worker pool** that is created before each build
+and deleted after. The lifecycle is wrapped in `build_lmcache_amd.sh`:
+
+```bash
+cd ~/git/LMCache
+./docker/build_lmcache_amd.sh
+```
+
+The script:
+1. Creates worker pool `lmcache-amd-pool` (`n2d-standard-32`, 300 GB
+   disk) in `us-central1`.
+2. Submits the build per `docker/cloudbuild.yaml`. The build pushes
+   `gcr.io/character-ai/lmcache/lmcache-amd:<short-sha>` and
+   `:dev_<build-id>`.
+3. Deletes the worker pool (via `trap cleanup EXIT` — runs even on
+   build failure).
+
+Override defaults via env vars:
+
+```bash
+MACHINE=n2d-standard-64 DISK_GB=400 ./docker/build_lmcache_amd.sh
+```
+
+> **Why `n2d` and not `c2d`/`c3d`?** Cloud Build private worker pools
+> only accept the `e2`, `n2d`, and `c3` machine families per the
+> [worker-pool config schema][wp-schema]. `n2d` is the AMD EPYC
+> option. `c2d`/`c3d` exist as GCE machine types but are NOT accepted
+> by the worker-pool API.
+>
+> [wp-schema]: https://docs.cloud.google.com/build/docs/private-pools/worker-pool-config-file-schema
+
+**Required GCP permissions**:
+- `cloudbuild.workerPools.create`, `cloudbuild.workerPools.delete`
+- `cloudbuild.builds.create`
+- `storage.objects.create` on the GCR bucket
+
+**Manual local build** (only useful on a Linux dev box with ROCm
+installed):
+
+```bash
+cd ~/git/LMCache
+docker build -f docker/Dockerfile.amd -t lmcache-amd:test .
+```
+
+**Run example** (operator's DaemonSet sets the args; this is just for
+ad-hoc smoke testing):
+
+```bash
+docker run --rm --device=/dev/kfd --device=/dev/dri \
+  --security-opt seccomp=unconfined \
+  --ipc=host \
+  gcr.io/character-ai/lmcache/lmcache-amd:<sha> --help
+```
+
+---
+
 ## Which Dockerfile Should I Use?
 
 ### Use `Dockerfile` if you:
@@ -157,6 +234,10 @@ docker run --runtime nvidia --gpus all \
 ### Use `Dockerfile.lightweight` if you:
 - Prefer stable releases from PyPI
 - Need fast build times
+
+### Use `Dockerfile.amd` if you:
+- Are deploying LMCache MP mode on AMD MI325X or MI350 GPUs
+- Need the standalone LMCache server (operator DaemonSet pattern)
 
 ---
 

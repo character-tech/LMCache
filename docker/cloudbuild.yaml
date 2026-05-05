@@ -1,0 +1,33 @@
+# Cloud Build config for the AMD LMCache image.
+#
+# Runs on a private worker pool with AMD EPYC hosts (n2d family) — see
+# build_lmcache_amd.sh for the create/submit/delete lifecycle. The pool
+# is transient: created right before the build, deleted right after.
+#
+# The build host is AMD EPYC; the resulting image runs on real MI325X /
+# MI350 nodes at deploy time. hipcc cross-compiles AOT for both
+# gfx942 (MI325X) and gfx950 (MI350) inside one fat binary — no GPU
+# is required at build time.
+
+timeout: 7200s
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -f
+      - docker/Dockerfile.amd
+      - -t
+      - 'gcr.io/character-ai/lmcache/lmcache-amd:${SHORT_SHA}'
+      - -t
+      - 'gcr.io/character-ai/lmcache/lmcache-amd:dev_${BUILD_ID}'
+      - .
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', 'gcr.io/character-ai/lmcache/lmcache-amd']
+
+# Route the build to the AMD EPYC private worker pool created by
+# build_lmcache_amd.sh. Do NOT also set `options.machineType` — that
+# field only supports the Intel E2/N1 enums and is mutually exclusive
+# with `options.pool.name`.
+options:
+  pool:
+    name: 'projects/character-ai/locations/us-central1/workerPools/lmcache-amd-pool'
