@@ -39,12 +39,16 @@ RUN uv pip install -r requirements/build.txt
 
 RUN python3 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
+# Cloud Build's source upload omits .git, so setuptools-scm can't infer
+# a version. Pin a placeholder — the version string is only used for
+# PyPI metadata, not for runtime behavior.
 RUN PYTORCH_ROCM_ARCH="gfx942 gfx950" \
     TORCH_DONT_CHECK_COMPILER_ABI=1 \
     CXX=hipcc \
     BUILD_WITH_HIP=1 \
     ROCM_HOME=/opt/rocm \
     HIP_PLATFORM=amd \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+amd \
     uv pip install -e . --no-build-isolation --verbose
 
 RUN python3 -c "from lmcache.v1.memory_management import lmc_ops; print('lmc_ops OK')"
