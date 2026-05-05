@@ -1,0 +1,57 @@
+# LMCache standalone server image for AMD GPUs (MI325X / MI350).
+#
+# Builds the LMCache HIP extension (rocm_extension in setup.py) as a fat
+# binary covering both gfx942 (MI325X) and gfx950 (MI350). Cross-compiles
+# AOT via hipcc — no AMD GPU is required at build time, only the ROCm
+# dev toolchain that lives inside the rocm/pytorch base image.
+#
+# This image is the LMCache MP-mode daemon used by the operator's
+# DaemonSet. The vLLM container does NOT need LMCache compiled in for
+# MP mode — it talks to this server over HIP IPC via LMCacheMPConnector.
+#
+# Why we don't `uv pip install torch torchvision --index-url .../rocm7.0`
+# (per the upstream install guide): the rocm/pytorch base already ships a
+# matching torch+ROCm build. Overriding it with a different ROCm-tagged
+# wheel risks runtime ABI mismatch against the base image's ROCm runtime.
+
+ARG BASE_IMAGE=rocm/pytorch:rocm7.2.3_ubuntu24.04_py3.12_pytorch_release_2.10.0
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive
+# The rocm/pytorch base image installs torch into /opt/venv (a real venv).
+# The OS-level Python at /usr is PEP 668 externally-managed and rejects
+# `uv pip install --system`. Activating the bundled venv puts uv into
+# venv mode automatically and lands installs in the same env that ships
+# torch+ROCm 2.10.
+ENV VIRTUAL_ENV=/opt/venv
+ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
+
+WORKDIR /workspace
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
+    mv /root/.local/bin/uv /usr/local/bin/uv && \
+    mv /root/.local/bin/uvx /usr/local/bin/uvx
+
+COPY . /workspace/LMCache
+WORKDIR /workspace/LMCache
+
+RUN uv pip install -r requirements/build.txt -r requirements/cli.txt
+
+RUN python3 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
+
+# Cloud Build's source upload omits .git, so setuptools-scm can't infer
+# a version. Pin a placeholder — the version string is only used for
+# PyPI metadata, not for runtime behavior.
+RUN PYTORCH_ROCM_ARCH="gfx942 gfx950" \
+    TORCH_DONT_CHECK_COMPILER_ABI=1 \
+    CXX=hipcc \
+    BUILD_WITH_HIP=1 \
+    ROCM_HOME=/opt/rocm \
+    HIP_PLATFORM=amd \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+amd \
+    uv pip install -e . --no-build-isolation --verbose
+
+RUN python3 -c "from lmcache.v1.memory_management import lmc_ops; print('lmc_ops OK')"
+
+WORKDIR /workspace
+ENTRYPOINT ["lmcache", "server"]
