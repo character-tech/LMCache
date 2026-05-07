@@ -14,7 +14,7 @@
 # matching torch+ROCm build. Overriding it with a different ROCm-tagged
 # wheel risks runtime ABI mismatch against the base image's ROCm runtime.
 
-ARG BASE_IMAGE=rocm/pytorch:rocm7.2.3_ubuntu24.04_py3.12_pytorch_release_2.10.0
+ARG BASE_IMAGE=rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -22,7 +22,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # The OS-level Python at /usr is PEP 668 externally-managed and rejects
 # `uv pip install --system`. Activating the bundled venv puts uv into
 # venv mode automatically and lands installs in the same env that ships
-# torch+ROCm 2.10.
+# torch+ROCm 2.9.1.
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
 
