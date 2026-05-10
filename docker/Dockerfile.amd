@@ -1,7 +1,6 @@
-# LMCache server image built on our internal vLLM-ROCm image so the LMCache
-# engine and vLLM workers share the same torch+ROCm build (and therefore the
-# same HIP IPC ABI). Mismatched torch builds can cause IPC event waits to
-# never wake — observed as the engine going silent under load on MI350.
+# Build on internal vLLM-ROCm image so LMCache engine and vLLM workers share
+# the same torch+ROCm build (HIP IPC ABI). Mismatched builds cause IPC event
+# waits to never wake — engine goes silent under load on MI350.
 
 ARG BASE_IMAGE=gcr.io/character-ai/vllm/vllm-forked-amd:prod_20260507233711
 FROM ${BASE_IMAGE}
@@ -13,14 +12,13 @@ WORKDIR /workspace
 COPY . /workspace/LMCache
 WORKDIR /workspace/LMCache
 
-# Base uses system Python 3.12 with uv preinstalled; --system targets the
-# same site-packages as torch.
+# Base uses system Python 3.12; --system targets torch's site-packages.
 RUN uv pip install --system -r requirements/build.txt -r requirements/cli.txt
 
 RUN python3 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
-# Fat binary covering MI325X (gfx942) and MI350 (gfx950). Placeholder version
-# because Cloud Build omits .git, breaking setuptools-scm.
+# Fat binary for MI325X (gfx942) + MI350 (gfx950). Placeholder version
+# because Cloud Build omits .git.
 RUN PYTORCH_ROCM_ARCH="gfx942 gfx950" \
     TORCH_DONT_CHECK_COMPILER_ABI=1 \
     CXX=hipcc \
@@ -32,7 +30,7 @@ RUN PYTORCH_ROCM_ARCH="gfx942 gfx950" \
 
 RUN python3 -c "from lmcache.v1.memory_management import lmc_ops; print('lmc_ops OK')"
 
-# Operator hardcodes /opt/venv/bin/lmcache. Symlink to the system install.
+# Operator hardcodes /opt/venv/bin/lmcache.
 RUN mkdir -p /opt/venv/bin && ln -sf /usr/local/bin/lmcache /opt/venv/bin/lmcache
 
 WORKDIR /workspace
