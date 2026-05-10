@@ -7,19 +7,15 @@ ARG BASE_IMAGE=gcr.io/character-ai/vllm/vllm-forked-amd:prod_20260507233711
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
 
 WORKDIR /workspace
-
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
-    mv /root/.local/bin/uv /usr/local/bin/uv && \
-    mv /root/.local/bin/uvx /usr/local/bin/uvx
 
 COPY . /workspace/LMCache
 WORKDIR /workspace/LMCache
 
-RUN uv pip install -r requirements/build.txt -r requirements/cli.txt
+# Base uses system Python 3.12 with uv preinstalled; --system targets the
+# same site-packages as torch.
+RUN uv pip install --system -r requirements/build.txt -r requirements/cli.txt
 
 RUN python3 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
@@ -32,7 +28,7 @@ RUN PYTORCH_ROCM_ARCH="gfx942 gfx950" \
     ROCM_HOME=/opt/rocm \
     HIP_PLATFORM=amd \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+amd \
-    uv pip install -e . --no-build-isolation --verbose
+    uv pip install --system -e . --no-build-isolation --verbose
 
 RUN python3 -c "from lmcache.v1.memory_management import lmc_ops; print('lmc_ops OK')"
 
