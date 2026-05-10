@@ -13,20 +13,9 @@ WORKDIR /workspace
 COPY . /workspace/LMCache
 WORKDIR /workspace/LMCache
 
-# Operator hardcodes /opt/venv/bin/lmcache. --system-site-packages inherits
-# the base image's torch instead of pulling a different ROCm wheel.
-RUN uv venv --python 3.12 --system-site-packages /opt/venv
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH=/opt/venv/bin:${PATH}
-
-# Pin torch to whatever the base image installed (e.g. 2.9.1+git8907517) so
-# uv doesn't replace it with a PyPI build during `uv pip install -e .` —
-# requirements/common.txt declares an unpinned `torch` dep that resolves to
-# PyPI's latest CUDA build otherwise, breaking the IPC ABI match we need.
-RUN echo "torch==$(python3 -c 'import torch; print(torch.__version__)')" > /tmp/constraints.txt && \
-    cat /tmp/constraints.txt
-
-RUN uv pip install -c /tmp/constraints.txt -r requirements/build.txt -r requirements/cli.txt
+# Base uses system Python 3.12 with uv preinstalled; --system targets the
+# same site-packages as torch.
+RUN uv pip install --system -r requirements/build.txt -r requirements/cli.txt
 
 RUN python3 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
@@ -39,9 +28,12 @@ RUN PYTORCH_ROCM_ARCH="gfx942 gfx950" \
     ROCM_HOME=/opt/rocm \
     HIP_PLATFORM=amd \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+amd \
-    uv pip install -c /tmp/constraints.txt -e . --no-build-isolation --verbose
+    uv pip install --system -e . --no-build-isolation --verbose
 
 RUN python3 -c "from lmcache.v1.memory_management import lmc_ops; print('lmc_ops OK')"
+
+# Operator hardcodes /opt/venv/bin/lmcache. Symlink to the system install.
+RUN mkdir -p /opt/venv/bin && ln -sf /usr/local/bin/lmcache /opt/venv/bin/lmcache
 
 WORKDIR /workspace
 ENTRYPOINT ["lmcache", "server"]
