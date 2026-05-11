@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 from itertools import islice
@@ -150,6 +151,60 @@ def batched_iteration(lst: list, batch_size: int) -> Generator[tuple, None, None
         yield batch
 
 
+# Maximum number of IPC-imported torch.cuda.Event objects to retain.
+# These wrap HIP/CUDA events imported from vLLM workers; their C++
+# destructors call hipEventDestroy/cudaEventDestroy, which on ROCm 7.0
+# (MI350x) busy-spin inside the HIP runtime when invoked on the hot
+# path before the producer-side event has been released.  By keeping a
+# bounded LRU of imported events alive (keyed by their raw IPC handle
+# bytes) we (a) re-use the same wrapper for every store/retrieve that
+# arrives with the same handle within a forward pass and (b) defer the
+# destructor until the wrapper is evicted, by which point the producer
+# has long since freed the underlying event so the destroy call is
+# cheap.  See PR notes for the rocgdb evidence.
+_IPC_EVENT_CACHE_SIZE = 1024
+
+
+class _IPCEventCache:
+    """Bounded LRU cache of IPC-imported ``torch.cuda.Event`` wrappers.
+
+    Keyed by the raw bytes of the IPC handle so that repeated stores
+    and retrieves from the same producer event share a single wrapper
+    instead of constructing+destroying one per call.
+    """
+
+    def __init__(self, max_size: int = _IPC_EVENT_CACHE_SIZE) -> None:
+        self._max_size = max_size
+        self._cache: "OrderedDict[bytes, torch.cuda.Event]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def get(
+        self, device: torch.device, event_ipc_handle: bytes
+    ) -> torch.cuda.Event:
+        """Return a cached imported event, importing it on first sight.
+
+        The returned wrapper is kept alive by the cache; callers must
+        not hold on to it past the call site (eviction may run its
+        destructor at any time on a later ``get``).
+        """
+        with self._lock:
+            cached = self._cache.get(event_ipc_handle)
+            if cached is not None:
+                self._cache.move_to_end(event_ipc_handle)
+                return cached
+            event = torch.cuda.Event.from_ipc_handle(device, event_ipc_handle)
+            self._cache[event_ipc_handle] = event
+            # Evict oldest entries once we exceed the bound.  The
+            # evicted wrapper's destructor will run here (on the
+            # caller's thread), but at this point it is at least
+            # ``max_size`` operations old, long after the producer
+            # event has been signalled and released, so the HIP
+            # destroy call no longer spins.
+            while len(self._cache) > self._max_size:
+                self._cache.popitem(last=False)
+            return event
+
+
 @dataclass
 class _PrefetchJob:
     handle: PrefetchHandle
@@ -191,6 +246,11 @@ class MPCacheEngine:
 
         # EventBus for observability
         self._event_bus = get_event_bus()
+
+        # Cache of IPC-imported torch.cuda.Event wrappers, keyed by
+        # the producer's IPC handle bytes.  See _IPCEventCache for the
+        # ROCm 7.0 hipEventDestroy spin this works around.
+        self._ipc_event_cache = _IPCEventCache()
 
         # Prefetch job tracking for two-phase lookup, keyed by request_id.
         # TODO: implement periodic cleanup of stale _prefetch_jobs entries
@@ -297,8 +357,10 @@ class MPCacheEngine:
             # Stage all block_ids to GPU once before the loop
             all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
 
-            # Wait for vLLM to finish
-            vllm_event = torch.cuda.Event.from_ipc_handle(
+            # Wait for vLLM to finish.  The imported event is retained
+            # by ``self._ipc_event_cache`` so its destructor does not
+            # run on the hot path (see _IPCEventCache).
+            vllm_event = self._ipc_event_cache.get(
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
