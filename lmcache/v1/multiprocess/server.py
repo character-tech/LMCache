@@ -302,11 +302,8 @@ class MPCacheEngine:
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
-            # Drain producer-side stream-write before the wrapper drops.
-            # Without this, ~IPCEvent's destructor spins in
-            # IPCEvent::synchronize on ROCm 7.0 waiting for signal[offset]
-            # to clear (clr/hipamd/src/hip_event_ipc.cpp). Synchronizing
-            # here ensures the slot is already cleared when destroy runs.
+            # Drain producer stream so ~IPCEvent doesn't spin on
+            # signal[offset] (ROCm 7.0 hip_event_ipc.cpp:92).
             vllm_event.synchronize()
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
