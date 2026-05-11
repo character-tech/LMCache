@@ -297,7 +297,7 @@ class MPCacheEngine:
             # Stage all block_ids to GPU once before the loop
             all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
 
-            # Wait for vLLM to finish.
+            # Wait for vLLM to finish
             vllm_event = torch.cuda.Event.from_ipc_handle(
                 gpu_context.device, event_ipc_handle
             )
