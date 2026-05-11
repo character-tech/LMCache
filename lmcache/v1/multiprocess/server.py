@@ -302,6 +302,9 @@ class MPCacheEngine:
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
+            # Drain producer stream so ~IPCEvent doesn't race the
+            # streamOpsWrite that clears signal[offset] on ROCm 7.0.x.
+            vllm_event.synchronize()
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
