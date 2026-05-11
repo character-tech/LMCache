@@ -22,7 +22,7 @@ RUN PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
     ROCM_HOME=/opt/rocm \
     HIP_PLATFORM=amd \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+amd \
-    pip install -e . --no-build-isolation --verbose
+    uv pip install --system -e . --no-build-isolation --verbose
 
 RUN python3 -c "from lmcache.v1.memory_management import lmc_ops; print('lmc_ops OK')"
 
