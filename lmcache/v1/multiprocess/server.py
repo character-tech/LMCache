@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 from itertools import islice
@@ -151,36 +150,6 @@ def batched_iteration(lst: list, batch_size: int) -> Generator[tuple, None, None
         yield batch
 
 
-# Bounded LRU of IPC-imported torch.cuda.Event wrappers, keyed by raw IPC
-# handle bytes. Avoids running hipEventDestroy on the hot path: on ROCm 7.0
-# the destructor busy-spins waiting for the producer to clear the signal
-# slot (see IPCEvent::synchronize in clr/hipamd/src/hip_event_ipc.cpp).
-# Deferring destruction until eviction (>= max_size operations later) gives
-# the producer time to release, so destroy returns promptly.
-_IPC_EVENT_CACHE_SIZE = 1024
-
-
-class _IPCEventCache:
-    def __init__(self, max_size: int = _IPC_EVENT_CACHE_SIZE) -> None:
-        self._max_size = max_size
-        self._cache: "OrderedDict[bytes, torch.cuda.Event]" = OrderedDict()
-        self._lock = threading.Lock()
-
-    def get(
-        self, device: torch.device, event_ipc_handle: bytes
-    ) -> torch.cuda.Event:
-        with self._lock:
-            cached = self._cache.get(event_ipc_handle)
-            if cached is not None:
-                self._cache.move_to_end(event_ipc_handle)
-                return cached
-            event = torch.cuda.Event.from_ipc_handle(device, event_ipc_handle)
-            self._cache[event_ipc_handle] = event
-            while len(self._cache) > self._max_size:
-                self._cache.popitem(last=False)
-            return event
-
-
 @dataclass
 class _PrefetchJob:
     handle: PrefetchHandle
@@ -222,8 +191,6 @@ class MPCacheEngine:
 
         # EventBus for observability
         self._event_bus = get_event_bus()
-
-        self._ipc_event_cache = _IPCEventCache()
 
         # Prefetch job tracking for two-phase lookup, keyed by request_id.
         # TODO: implement periodic cleanup of stale _prefetch_jobs entries
@@ -330,12 +297,17 @@ class MPCacheEngine:
             # Stage all block_ids to GPU once before the loop
             all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
 
-            # Wait for vLLM to finish. Event is cached to defer hipEventDestroy
-            # off the hot path (ROCm 7.0 spin in IPCEvent::synchronize).
-            vllm_event = self._ipc_event_cache.get(
+            # Wait for vLLM to finish.
+            vllm_event = torch.cuda.Event.from_ipc_handle(
                 gpu_context.device, event_ipc_handle
             )
             vllm_event.wait(stream=gpu_context.stream)
+            # Drain producer-side stream-write before the wrapper drops.
+            # Without this, ~IPCEvent's destructor spins in
+            # IPCEvent::synchronize on ROCm 7.0 waiting for signal[offset]
+            # to clear (clr/hipamd/src/hip_event_ipc.cpp). Synchronizing
+            # here ensures the slot is already cleared when destroy runs.
+            vllm_event.synchronize()
 
             # CPU-synchronous sentinel: a GPU store is about to be enqueued.
             # Must be published via publish() (not publish_on_stream) so the
