@@ -21,8 +21,11 @@ WORKDIR /workspace/LMCache
 
 RUN uv pip install -r requirements/build.txt -r requirements/cli.txt
 
-# Override base's torch 2.9.1 with 2.10.0+rocm7.0.
-RUN uv pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.0
+# Override base's torch 2.9.1 with 2.10.0+rocm7.0. Pin the version explicitly
+# because uv otherwise keeps the base's already-installed torch.
+RUN uv pip install --force-reinstall \
+    'torch==2.10.0+rocm7.0' 'torchvision==0.25.0+rocm7.0' \
+    --index-url https://download.pytorch.org/whl/rocm7.0
 
 RUN python3 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
