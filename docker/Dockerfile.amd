@@ -1,28 +1,12 @@
-# LMCache standalone server image for AMD GPUs (MI325X / MI350).
-#
-# Builds the LMCache HIP extension (rocm_extension in setup.py) as a fat
-# binary covering both gfx942 (MI325X) and gfx950 (MI350). Cross-compiles
-# AOT via hipcc — no AMD GPU is required at build time, only the ROCm
-# dev toolchain that lives inside the rocm/pytorch base image.
-#
-# This image is the LMCache MP-mode daemon used by the operator's
-# DaemonSet. The vLLM container does NOT need LMCache compiled in for
-# MP mode — it talks to this server over HIP IPC via LMCacheMPConnector.
-#
-# Why we don't `uv pip install torch torchvision --index-url .../rocm7.0`
-# (per the upstream install guide): the rocm/pytorch base already ships a
-# matching torch+ROCm build. Overriding it with a different ROCm-tagged
-# wheel risks runtime ABI mismatch against the base image's ROCm runtime.
+# LMCache server image for AMD Instinct (MI325X / MI350).
+# Stack: ROCm 7.0.2 (HIP 7.0.51831) from rocm/pytorch base, torch 2.10.0+rocm7.0
+# overriding the base's 2.9.1 to match the verified working setup.
+# hipcc cross-compiles HIP kernels AOT for gfx942 + gfx950.
 
 ARG BASE_IMAGE=rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
 FROM ${BASE_IMAGE}
 
 ENV DEBIAN_FRONTEND=noninteractive
-# The rocm/pytorch base image installs torch into /opt/venv (a real venv).
-# The OS-level Python at /usr is PEP 668 externally-managed and rejects
-# `uv pip install --system`. Activating the bundled venv puts uv into
-# venv mode automatically and lands installs in the same env that ships
-# torch+ROCm 2.9.1.
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
 
@@ -37,12 +21,13 @@ WORKDIR /workspace/LMCache
 
 RUN uv pip install -r requirements/build.txt -r requirements/cli.txt
 
+# Override base's torch 2.9.1 with 2.10.0+rocm7.0.
+RUN uv pip install torch torchvision --index-url https://download.pytorch.org/whl/rocm7.0
+
 RUN python3 -c "import torch; assert torch.version.hip, 'torch is not a ROCm build'; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
-# Cloud Build's source upload omits .git, so setuptools-scm can't infer
-# a version. Pin a placeholder — the version string is only used for
-# PyPI metadata, not for runtime behavior.
-RUN PYTORCH_ROCM_ARCH="gfx942 gfx950" \
+ARG PYTORCH_ROCM_ARCH="gfx942 gfx950"
+RUN PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
     TORCH_DONT_CHECK_COMPILER_ABI=1 \
     CXX=hipcc \
     BUILD_WITH_HIP=1 \
