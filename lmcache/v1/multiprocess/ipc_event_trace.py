@@ -49,6 +49,16 @@ _id_counter = itertools.count()
 _live_count = 0
 _live_lock = threading.Lock()
 
+# Pending host-callback counter. Incremented when a Python host callback is
+# scheduled via launch_host_func; decremented when the callback actually runs
+# on the CUDA/HIP driver thread. If destructors are wedging the driver lock,
+# this counter stays high while live_count is also nonzero — the direct
+# fingerprint of the GIL x driver-lock AB-BA.
+_pending_callbacks = 0
+_pending_lock = threading.Lock()
+_cb_scheduled_total = 0
+_cb_run_total = 0
+
 
 def _bump(delta: int) -> int:
     global _live_count
@@ -129,3 +139,98 @@ def is_enabled() -> bool:
 
 def live_count() -> int:
     return _bump(0)
+
+
+def _bump_pending(delta: int, scheduled: bool = False, ran: bool = False) -> int:
+    global _pending_callbacks, _cb_scheduled_total, _cb_run_total
+    with _pending_lock:
+        _pending_callbacks += delta
+        if scheduled:
+            _cb_scheduled_total += 1
+        if ran:
+            _cb_run_total += 1
+        return _pending_callbacks
+
+
+def schedule_traced_callback(
+    stream: Any, handler: Any, payload: Any, kind: str
+) -> None:
+    """Schedule ``handler(payload)`` on *stream* via launch_host_func, with
+    pending-callback accounting. When the native recorder is not used (i.e.
+    we're on the unpatched code path), this is the only signal that lets us
+    correlate a wedged destructor with a stalled host callback."""
+    if not _ENABLED:
+        stream.launch_host_func(handler, payload)
+        return
+
+    seq = next(_id_counter)
+    scheduled_ns = time.monotonic_ns()
+    pending_after_schedule = _bump_pending(+1, scheduled=True)
+    logger.info(
+        "host_cb schedule id=%d kind=%s tid=%d pending=%d",
+        seq,
+        kind,
+        threading.get_ident(),
+        pending_after_schedule,
+    )
+
+    def _wrapped(p):
+        run_ns = time.monotonic_ns()
+        delay_ms = (run_ns - scheduled_ns) / 1e6
+        try:
+            handler(p)
+        finally:
+            pending_after_run = _bump_pending(-1, ran=True)
+            logger.info(
+                "host_cb run id=%d kind=%s tid=%d pending=%d delay_ms=%.3f",
+                seq,
+                kind,
+                threading.get_ident(),
+                pending_after_run,
+                delay_ms,
+            )
+
+    stream.launch_host_func(_wrapped, payload)
+
+
+def pending_callbacks() -> int:
+    return _bump_pending(0)
+
+
+def callback_totals() -> tuple[int, int]:
+    with _pending_lock:
+        return _cb_scheduled_total, _cb_run_total
+
+
+def start_sampler(interval_seconds: float = 0.1) -> None:
+    """Start a background thread that periodically logs live_count and
+    pending_callbacks. Cheap (no GIL contention in the sampler itself
+    beyond the log call) and runs forever. Idempotent."""
+    if not _ENABLED:
+        return
+    if getattr(start_sampler, "_started", False):
+        return
+    start_sampler._started = True  # type: ignore[attr-defined]
+
+    def _run():
+        last_scheduled = 0
+        last_run = 0
+        while True:
+            time.sleep(interval_seconds)
+            sched, ran = callback_totals()
+            d_sched = sched - last_scheduled
+            d_run = ran - last_run
+            last_scheduled, last_run = sched, ran
+            logger.info(
+                "sample live=%d pending_cb=%d d_scheduled=%d d_run=%d "
+                "total_scheduled=%d total_run=%d",
+                live_count(),
+                pending_callbacks(),
+                d_sched,
+                d_run,
+                sched,
+                ran,
+            )
+
+    t = threading.Thread(target=_run, daemon=True, name="ipc-event-sampler")
+    t.start()
