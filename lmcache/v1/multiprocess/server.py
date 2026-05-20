@@ -59,6 +59,10 @@ from lmcache.v1.multiprocess.custom_types import (
 from lmcache.v1.multiprocess.gpu_context import (
     GPUCacheContext,
 )
+from lmcache.v1.multiprocess.ipc_event_trace import (
+    from_ipc_handle as _ipc_from_handle,
+    new_event as _ipc_new_event,
+)
 from lmcache.v1.multiprocess.mq import MessageQueueServer
 from lmcache.v1.multiprocess.native_completion import (
     CompletionDispatcher,
@@ -325,9 +329,9 @@ class MPCacheEngine:
         assert key.worker_id is not None, "Must store with worker_id != None"
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
-        assert instance_id in self.gpu_contexts, (
-            f"KV cache not registered for GPU ID {instance_id}"
-        )
+        assert (
+            instance_id in self.gpu_contexts
+        ), f"KV cache not registered for GPU ID {instance_id}"
         gpu_context = self.gpu_contexts[instance_id]
         model_name = self.gpu_context_meta[instance_id][0]
 
@@ -348,7 +352,7 @@ class MPCacheEngine:
         ):
             # Not all backends support interprocess Events (CUDA IPC specific)
             check_interprocess_event_support()
-            event = torch_dev.Event(interprocess=True)
+            event = _ipc_new_event("store_local", gpu_context.device)
 
             # Stage all block_ids to GPU once before the loop
             all_block_ids_gpu = gpu_context.stage_block_ids(gpu_block_ids)
@@ -361,8 +365,8 @@ class MPCacheEngine:
                     "handles (Event.from_ipc_handle not available). "
                     "Multiprocess IPC requires CUDA."
                 )
-            vllm_event = torch_dev.Event.from_ipc_handle(
-                gpu_context.device, event_ipc_handle
+            vllm_event = _ipc_from_handle(
+                gpu_context.device, event_ipc_handle, "store_from_vllm"
             )
             vllm_event.wait(stream=gpu_context.stream)
 
@@ -518,9 +522,9 @@ class MPCacheEngine:
         assert key.worker_id is not None, "Must retrieve with worker_id != None"
         obj_keys = ipc_key_to_object_keys(key, chunk_hashes)
 
-        assert instance_id in self.gpu_contexts, (
-            f"KV cache not registered for GPU ID {instance_id}"
-        )
+        assert (
+            instance_id in self.gpu_contexts
+        ), f"KV cache not registered for GPU ID {instance_id}"
         gpu_context = self.gpu_contexts[instance_id]
         model_name = self.gpu_context_meta[instance_id][0]
 
@@ -634,7 +638,7 @@ class MPCacheEngine:
 
             # Not all backends support interprocess Events (CUDA IPC specific)
             check_interprocess_event_support()
-            event = torch_dev.Event(interprocess=True)
+            event = _ipc_new_event("retrieve_local", gpu_context.device)
 
             prefetched_keys: list[ObjectKey] = []
             retrieve_succeeded = False

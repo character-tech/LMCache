@@ -2,6 +2,10 @@
 
 #include "completion_recorder.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <utility>
 
 CompletionRecorder& CompletionRecorder::instance() {
@@ -24,11 +28,32 @@ std::vector<PendingCompletion> CompletionRecorder::drain() {
   return result;
 }
 
+static bool trace_enabled() {
+  static const bool enabled = [] {
+    const char* v = std::getenv("LMCACHE_DEBUG_IPC_LIFECYCLE");
+    return v && v[0] == '1';
+  }();
+  return enabled;
+}
+
+static std::atomic<uint64_t> g_callback_counter{0};
+
 static void
 #ifndef USE_ROCM
     CUDART_CB
 #endif
     completion_host_callback(void* data) {
+  if (trace_enabled()) {
+    auto id = g_callback_counter.fetch_add(1, std::memory_order_relaxed);
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now().time_since_epoch())
+                      .count();
+    // Driver thread; no GIL — printf is safe and async-signal-ish.
+    std::fprintf(stderr,
+                 "ipc_event host_cb id=%llu monotonic_ns=%lld\n",
+                 static_cast<unsigned long long>(id),
+                 static_cast<long long>(now_ns));
+  }
   auto* completion = static_cast<PendingCompletion*>(data);
   CompletionRecorder::instance().push(completion);
 }
