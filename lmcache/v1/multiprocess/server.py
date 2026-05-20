@@ -12,7 +12,26 @@ import time
 import zmq
 
 # First Party
-from lmcache import torch_dev, torch_device_type
+try:
+    from lmcache import torch_dev, torch_device_type
+except ImportError:
+    # Older lmcache installs don't expose torch_dev at the package root.
+    # Mirror the upstream _detect_device logic inline so this instrumentation
+    # branch can be copied onto older bases (dev pod).
+    import torch as _torch_for_dev_detect
+
+    if _torch_for_dev_detect.cuda.is_available():
+        torch_dev = _torch_for_dev_detect.cuda
+        torch_device_type = "cuda"
+    elif (
+        hasattr(_torch_for_dev_detect, "xpu")
+        and _torch_for_dev_detect.xpu.is_available()
+    ):
+        torch_dev = _torch_for_dev_detect.xpu
+        torch_device_type = "xpu"
+    else:
+        torch_dev = _torch_for_dev_detect.cuda
+        torch_device_type = "cuda"
 from lmcache.logging import init_logger
 from lmcache.utils import (
     EngineType,

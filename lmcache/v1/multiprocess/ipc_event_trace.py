@@ -25,9 +25,22 @@ import os
 import threading
 import time
 
+# Third Party
+import torch
+
 # First Party
-from lmcache import torch_dev
 from lmcache.logging import init_logger
+
+# Mirror lmcache's torch_dev detection without depending on a symbol that may
+# not exist in older lmcache installs. We only need Event() and from_ipc_handle.
+if torch.cuda.is_available():
+    torch_dev = torch.cuda
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    torch_dev = torch.xpu
+elif hasattr(torch, "hpu") and torch.hpu.is_available():
+    torch_dev = torch.hpu
+else:
+    torch_dev = torch.cuda  # last resort; tracing is a no-op without GPU anyway
 
 logger = init_logger(__name__)
 
