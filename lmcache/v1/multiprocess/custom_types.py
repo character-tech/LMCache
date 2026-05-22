@@ -2,6 +2,8 @@
 # Standard
 from dataclasses import dataclass, field
 from typing import Any, Callable
+import logging
+import os
 import pickle
 import threading
 
@@ -18,6 +20,8 @@ Key Types:
   - Contains token_ids, start, end, request_id (all required)
   - Converted to ObjectKey for storage operations via ipc_key_to_object_keys()
 """
+
+_ipc_logger = logging.getLogger("lmcache.ipc_debug")
 
 
 class CudaIPCWrapper:
@@ -81,17 +85,69 @@ class CudaIPCWrapper:
         device_index = tensor.device.index
         self.device_uuid = CudaIPCWrapper._get_device_uuid(device_index)
 
+        _ipc_logger.debug(
+            "[IPC PRODUCER] pid=%d device_index=%d device_uuid=%s "
+            "handle_len=%d handle_version=%d handle_type=%d(%s) "
+            "shm_path=%s handle1_hex=%s shape=%s dtype=%s",
+            os.getpid(),
+            device_index,
+            self.device_uuid,
+            len(handle[1]) if isinstance(handle[1], (bytes, bytearray)) else -1,
+            handle[1][0] if isinstance(handle[1], (bytes, bytearray)) and len(handle[1]) > 0 else -1,
+            handle[1][1] if isinstance(handle[1], (bytes, bytearray)) and len(handle[1]) > 1 else -1,
+            chr(handle[1][1]) if isinstance(handle[1], (bytes, bytearray)) and len(handle[1]) > 1 else "?",
+            handle[4] if len(handle) > 4 else "N/A",
+            handle[1].hex()[:32] if isinstance(handle[1], (bytes, bytearray)) else str(handle[1])[:32],
+            self.shape,
+            self.dtype,
+        )
+
     def to_tensor(self) -> torch.Tensor:
         """
         Note:
             This function may break if torch cuda is not initialized.
             We should call `torch.cuda.init()` before using this function.
         """
+        CudaIPCWrapper._discover_gpu_devices()
+        with CudaIPCWrapper._device_mapping_lock:
+            local_uuid_map = dict(CudaIPCWrapper._discovered_device_mapping)
+
         device_index = CudaIPCWrapper._get_device_index_from_uuid(self.device_uuid)
 
-        storage = torch.UntypedStorage._new_shared_cuda(  # noqa: SLF001
-            device_index, *self.handle[1:]
+        handle = self.handle
+        _ipc_logger.debug(
+            "[IPC CONSUMER] pid=%d producer_uuid=%s resolved_device_index=%d "
+            "local_uuid_map=%s handle_len=%d handle_version=%d handle_type=%d(%s) "
+            "shm_path=%s handle1_hex=%s shape=%s dtype=%s",
+            os.getpid(),
+            self.device_uuid,
+            device_index,
+            local_uuid_map,
+            len(handle[1]) if isinstance(handle[1], (bytes, bytearray)) else -1,
+            handle[1][0] if isinstance(handle[1], (bytes, bytearray)) and len(handle[1]) > 0 else -1,
+            handle[1][1] if isinstance(handle[1], (bytes, bytearray)) and len(handle[1]) > 1 else -1,
+            chr(handle[1][1]) if isinstance(handle[1], (bytes, bytearray)) and len(handle[1]) > 1 else "?",
+            handle[4] if len(handle) > 4 else "N/A",
+            handle[1].hex()[:32] if isinstance(handle[1], (bytes, bytearray)) else str(handle[1])[:32],
+            self.shape,
+            self.dtype,
         )
+
+        try:
+            storage = torch.UntypedStorage._new_shared_cuda(  # noqa: SLF001
+                device_index, *self.handle[1:]
+            )
+        except Exception as e:
+            _ipc_logger.error(
+                "[IPC CONSUMER] _new_shared_cuda FAILED pid=%d device_index=%d "
+                "producer_uuid=%s shm_path=%s error=%s",
+                os.getpid(),
+                device_index,
+                self.device_uuid,
+                handle[4] if len(handle) > 4 else "N/A",
+                e,
+            )
+            raise
 
         t = torch.empty((), device=f"cuda:{device_index}", dtype=self.dtype)
         t.set_(storage, self.storage_offset, self.shape, self.stride)
