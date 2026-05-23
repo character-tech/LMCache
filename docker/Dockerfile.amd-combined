@@ -38,7 +38,7 @@ RUN apt-get update -y && \
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uv /usr/local/bin/uv && \
     mv /root/.local/bin/uvx /usr/local/bin/uvx && \
-    uv venv --python python3.12 /opt/venv
+    uv venv --python python3.12 --seed /opt/venv
 
 # torch 2.10.0+rocm7.0 — matches the base ROCm 7.0.2 runtime.
 RUN uv pip install \
@@ -82,8 +82,15 @@ RUN python3 -c "import vllm; print('vLLM =', vllm.__version__)"
 # Mandatory for vLLM MLA init even with ROCM_AITER_MLA — see dev-pod
 # skill §5a. Triton backend, no Composable Kernel (avoids 48-min build).
 ARG FLASH_ATTN_REPO=https://github.com/Dao-AILab/flash-attention.git
-ARG FLASH_ATTN_REF=main
-RUN git clone --depth=1 --branch "${FLASH_ATTN_REF}" "${FLASH_ATTN_REPO}" /workspace/flash-attention
+# Pinned to the exact revision used on the amd4 dev pod (flash_attn 2.8.3).
+# This predates PR #2230 "Migrate to Triton Backend to Aiter" which added
+# a third_party/aiter submodule that flash-attention's setup.py auto-installs
+# during the editable build — we build aiter separately at a pinned revision.
+ARG FLASH_ATTN_REF=0e60e39473e8df549a20fb5353760f7a65b30e2d
+RUN git clone "${FLASH_ATTN_REPO}" /workspace/flash-attention && \
+    cd /workspace/flash-attention && \
+    git checkout "${FLASH_ATTN_REF}" && \
+    git submodule update --init --recursive csrc/cutlass
 WORKDIR /workspace/flash-attention
 RUN FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
     FLASH_ATTENTION_SKIP_CK_BUILD=TRUE \
@@ -94,8 +101,12 @@ RUN python3 -c "from flash_attn import flash_attn_varlen_func; print('flash_attn
 
 # Required at runtime when VLLM_ROCM_USE_AITER=1 (our prod default).
 ARG AITER_REPO=https://github.com/ROCm/aiter.git
-ARG AITER_REF=main
-RUN git clone --depth=1 --branch "${AITER_REF}" "${AITER_REPO}" /workspace/aiter
+# Pinned to the exact revision used on the amd4 dev pod (amd-aiter 0.1.10.post2).
+ARG AITER_REF=c3708fb7445899c14cdc6e8055953ee02ed78ddf
+RUN git clone "${AITER_REPO}" /workspace/aiter && \
+    cd /workspace/aiter && \
+    git checkout "${AITER_REF}" && \
+    git submodule update --init --recursive
 WORKDIR /workspace/aiter
 RUN GPU_ARCHS=native uv pip install --no-build-isolation -e .
 RUN python3 -c "import aiter; print('aiter OK')"
@@ -108,17 +119,19 @@ WORKDIR /workspace/LMCache
 
 RUN uv pip install -r requirements/build.txt -r requirements/cli.txt
 
+# cupy-rocm-7-0 is a hard runtime dep of LMCache on ROCm 7.0 (per dev-pod
+# verified env). It's not in any requirements/*.txt, so install it explicitly.
+RUN uv pip install cupy-rocm-7-0
+
 # Cloud Build context omits .git → pin a placeholder for setuptools-scm.
+# Letting pip resolve deps from setup.py is correct here (mirrors the dev
+# pod build). Earlier --no-deps + manual pin was a mistake; LMCache pulls
+# in aiofile, awscrt, blake3, numba, transformers, opentelemetry-*, etc.
 RUN TORCH_DONT_CHECK_COMPILER_ABI=1 \
     CXX=hipcc \
     BUILD_WITH_HIP=1 \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+amd \
     uv pip install -e . --no-build-isolation --verbose
-
-# Runtime deps not pulled in by the HIP build path (per dev-pod recipe).
-RUN uv pip install --no-deps \
-        msgspec pyzmq pyyaml prometheus-client redis \
-        aiofiles psutil sortedcontainers cufile-python
 
 RUN python3 -c "from lmcache.v1.memory_management import lmc_ops; print('lmc_ops OK')" && \
     python3 -c "import lmcache.c_ops as o; assert hasattr(o, 'record_completion_on_stream'); print('c_ops OK')"
