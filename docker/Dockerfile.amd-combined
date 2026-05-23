@@ -1,34 +1,15 @@
 # Combined vLLM + LMCache image for AMD GPUs (MI325X / MI350) on ROCm 7.0.
 #
-# Why this image exists:
-#   The LMCache engineering team (Shaoting Feng, Yihua Cheng) confirmed
-#   that LMCache 0.4.4 MP mode on AMD was tested against exactly this
-#   stack:
-#     - ROCm 7.0.2 (HIP 7.0.51831)
-#     - PyTorch 2.10.0+rocm7.0
-#     - vLLM 0.19.0
-#     - LMCache 0.4.4
-#   Our current production stack uses ROCm 7.2 / torch 2.10+rocm7.2 for
-#   both vLLM v19 workers and the lmcache-operator engine and hits
-#   hipErrorInvalidDevicePointer on every REGISTER_KV_CACHE. This image
-#   rebuilds vLLM (cai-v0.19.0) and LMCache (cai-v0.4.4) against the
-#   verified torch 2.10.0+rocm7.0 base.
+# Reproduces the LMCache-team-verified stack (Shaoting Feng, Yihua Cheng):
+#   ROCm 7.0.2 (HIP 7.0.51831) + torch 2.10.0+rocm7.0 + vLLM 0.19.0 +
+#   LMCache 0.4.4. Our prod stack on rocm7.2 hits hipErrorInvalidDevicePointer
+#   on every REGISTER_KV_CACHE; this image isolates the ROCm version.
 #
-# Base layers:
-#   - rocm/dev-ubuntu-24.04:7.0.2-complete  (ROCm 7.0.2 dev toolkit + hipcc)
-#   - Python 3.12 + uv venv at /opt/venv
-#   - torch 2.10.0+rocm7.0  from https://download.pytorch.org/whl/rocm7.0
-#   - vLLM built from source (vendored into ./vllm-src by the wrapper
-#     script build_lmcache_vllm_amd.sh; auto-detects ROCm via torch.version.hip).
-#   - LMCache built from source (the build context — typically the
-#     cai-v0.4.4 branch this Dockerfile lives on). BUILD_WITH_HIP=1, hipcc.
+# Build recipe follows the amd4 dev pod's verified-working sequence
+# (see dev-pod-lmcache-mp skill, Appendix: optional builds).
 #
-# Entrypoint:
-#   Defaults to `lmcache server` so the existing operator DaemonSet works
-#   unchanged. Override at deploy time for the vLLM model-server pod, e.g.
-#     command: ["/opt/venv/bin/vllm", "serve", ...]
-#
-# Build context: the LMCache repo root.
+# Entrypoint defaults to `lmcache server` (drop-in for the operator
+# DaemonSet); override `command:` in the vLLM pod to `vllm serve`.
 
 ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:7.0.2-complete
 FROM ${BASE_IMAGE}
@@ -36,19 +17,15 @@ FROM ${BASE_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
-# vLLM ROCm extension build targets MI300X/MI325X (gfx942) + MI350 (gfx950).
 ENV PYTORCH_ROCM_ARCH="gfx942,gfx950"
 ENV ROCM_HOME=/opt/rocm
 ENV HIP_PLATFORM=amd
-# uv on Cloud Build hosts is sensitive to large wheel downloads; keep the
-# timeout generous and use copy-mode to avoid hardlink cache failures.
 ENV UV_HTTP_TIMEOUT=600
 ENV UV_LINK_MODE=copy
 ENV UV_INDEX_STRATEGY=unsafe-best-match
 
-# OS deps: Python 3.12, build toolchain, git for cloning vLLM, curl for uv.
-# vLLM ROCm extensions need libfmt, libmsgpack, sqlite, pkg-config;
-# torchvision/Pillow needs libjpeg; numpy/scipy need libgfortran5.
+# vLLM ROCm needs libfmt/libmsgpack/sqlite/pkg-config; torchvision needs
+# libjpeg; numpy/scipy need libgfortran5.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         ccache software-properties-common git curl sudo \
@@ -58,77 +35,89 @@ RUN apt-get update -y && \
         sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# uv + a real venv anchored at /opt/venv so subsequent `uv pip` lands there.
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh && \
     mv /root/.local/bin/uv /usr/local/bin/uv && \
     mv /root/.local/bin/uvx /usr/local/bin/uvx && \
     uv venv --python python3.12 /opt/venv
 
-# Install torch 2.10.0+rocm7.0 from PyTorch's ROCm 7.0 wheel index.
-# This is the wheel built against ROCm 7.0 userspace — matches the ROCm
-# runtime shipped in the base image, no ABI drift.
+# torch 2.10.0+rocm7.0 — matches the base ROCm 7.0.2 runtime.
 RUN uv pip install \
         --index-url https://download.pytorch.org/whl/rocm7.0 \
         "torch==2.10.0+rocm7.0" && \
-    python3 -c "import torch; assert torch.version.hip, 'torch is not ROCm'; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
+    python3 -c "import torch; assert torch.version.hip; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
 WORKDIR /workspace
 
-#################### Build vLLM from source (cai-v0.19.0) #####################
+#################### vLLM (cai-v0.19.0, from ./vllm-src) #####################
 
-# vLLM source is vendored into the build context at ./vllm-src by the
-# wrapper script (build_lmcache_vllm_amd.sh). We use COPY instead of
-# git clone because character-tech/vllm is private and Cloud Build has
-# no GitHub credentials in the build container.
+# vendored by build_lmcache_vllm_amd.sh — Cloud Build has no GitHub
+# credentials for the private character-tech/vllm repo.
 ARG MAX_JOBS=2
 
 COPY vllm-src /workspace/vllm
-
-# vLLM's setup.py auto-detects ROCm from torch.version.hip and pulls in
-# the right requirements file. --no-build-isolation reuses the torch we
-# just installed instead of resolving a fresh one in the build env.
-#
-# IMPORTANT: vLLM's rocm-build.txt contains
-#   --extra-index-url https://download.pytorch.org/whl/rocm7.1
-#   torch==2.10.0
-# which would resolve torch+rocm7.1, clobbering our rocm7.0 install.
-# Override with --index-url (CLI flag takes precedence over requirements
-# file) to keep all torch-family packages on the rocm7.0 index.
 WORKDIR /workspace/vllm
+
+# Strip torch/torchvision/torchaudio pins (and the rocm7.1 extra-index)
+# from every requirements/*.txt so the next install does not clobber
+# our torch 2.10.0+rocm7.0.
+RUN python3 use_existing_torch.py
+
 RUN uv pip install \
+        --extra-index-url https://download.pytorch.org/whl/rocm7.0 \
         -r requirements/rocm-build.txt \
-        -r requirements/rocm.txt \
-        --index-url https://download.pytorch.org/whl/rocm7.0
+        -r requirements/rocm.txt
 RUN python3 -c "import torch; assert 'rocm7.0' in torch.__version__, f'expected rocm7.0, got {torch.__version__}'"
-RUN VLLM_TARGET_DEVICE=rocm \
-    MAX_JOBS=${MAX_JOBS} \
+
+RUN VLLM_TARGET_DEVICE=rocm MAX_JOBS=${MAX_JOBS} \
     uv pip install -e . --no-build-isolation --verbose
 
 RUN python3 -c "import vllm; print('vLLM =', vllm.__version__)"
 
-#################### Build LMCache from source (build context) #################
+#################### flash_attn (triton-AMD backend) #########################
 
-# The build context is the LMCache repo root — copy it in last to maximize
-# layer cache reuse when only LMCache source changes between builds.
+# Mandatory for vLLM MLA init even with ROCM_AITER_MLA — see dev-pod
+# skill §5a. Triton backend, no Composable Kernel (avoids 48-min build).
+ARG FLASH_ATTN_REPO=https://github.com/Dao-AILab/flash-attention.git
+ARG FLASH_ATTN_REF=main
+RUN git clone --depth=1 --branch "${FLASH_ATTN_REF}" "${FLASH_ATTN_REPO}" /workspace/flash-attention
+WORKDIR /workspace/flash-attention
+RUN FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
+    FLASH_ATTENTION_SKIP_CK_BUILD=TRUE \
+    uv pip install --no-build-isolation -e .
+RUN python3 -c "from flash_attn import flash_attn_varlen_func; print('flash_attn OK')"
+
+#################### aiter (ROCm fused kernels) ##############################
+
+# Required at runtime when VLLM_ROCM_USE_AITER=1 (our prod default).
+ARG AITER_REPO=https://github.com/ROCm/aiter.git
+ARG AITER_REF=main
+RUN git clone --depth=1 --branch "${AITER_REF}" "${AITER_REPO}" /workspace/aiter
+WORKDIR /workspace/aiter
+RUN GPU_ARCHS=native uv pip install --no-build-isolation -e .
+RUN python3 -c "import aiter; print('aiter OK')"
+
+#################### LMCache (this repo, BUILD_WITH_HIP=1) ###################
+
+# Copied last to maximize layer-cache reuse on LMCache-only changes.
 COPY . /workspace/LMCache
 WORKDIR /workspace/LMCache
 
 RUN uv pip install -r requirements/build.txt -r requirements/cli.txt
 
-# Cloud Build's source upload omits .git, so setuptools-scm cannot infer
-# a version — pin a placeholder, the value is only used for PyPI metadata.
+# Cloud Build context omits .git → pin a placeholder for setuptools-scm.
 RUN TORCH_DONT_CHECK_COMPILER_ABI=1 \
     CXX=hipcc \
     BUILD_WITH_HIP=1 \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+amd \
     uv pip install -e . --no-build-isolation --verbose
 
+# Runtime deps not pulled in by the HIP build path (per dev-pod recipe).
+RUN uv pip install --no-deps \
+        msgspec pyzmq pyyaml prometheus-client redis \
+        aiofiles psutil sortedcontainers cufile-python
+
 RUN python3 -c "from lmcache.v1.memory_management import lmc_ops; print('lmc_ops OK')" && \
     python3 -c "import lmcache.c_ops as o; assert hasattr(o, 'record_completion_on_stream'); print('c_ops OK')"
 
 WORKDIR /workspace
-
-# Default entrypoint matches the existing lmcache-operator DaemonSet so this
-# image is a drop-in replacement for `lmcache-amd`. Override `command:` in
-# the vLLM model-server pod spec to run `vllm serve` instead.
 ENTRYPOINT ["lmcache", "server"]
