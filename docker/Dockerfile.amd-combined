@@ -44,13 +44,18 @@ ENV HIP_PLATFORM=amd
 # timeout generous and use copy-mode to avoid hardlink cache failures.
 ENV UV_HTTP_TIMEOUT=600
 ENV UV_LINK_MODE=copy
+ENV UV_INDEX_STRATEGY=unsafe-best-match
 
 # OS deps: Python 3.12, build toolchain, git for cloning vLLM, curl for uv.
+# vLLM ROCm extensions need libfmt, libmsgpack, sqlite, pkg-config;
+# torchvision/Pillow needs libjpeg; numpy/scipy need libgfortran5.
 RUN apt-get update -y && \
     apt-get install -y --no-install-recommends \
         ccache software-properties-common git curl sudo \
         python3.12 python3.12-dev python3.12-venv python3-pip \
-        build-essential libnuma-dev tzdata ca-certificates && \
+        build-essential libnuma-dev tzdata ca-certificates \
+        pkg-config libjpeg-dev libgfortran5 \
+        sqlite3 libsqlite3-dev libfmt-dev libmsgpack-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # uv + a real venv anchored at /opt/venv so subsequent `uv pip` lands there.
@@ -73,7 +78,7 @@ WORKDIR /workspace
 
 ARG VLLM_REPO=https://github.com/character-tech/vllm.git
 ARG VLLM_BRANCH=cai-v0.19.0
-ARG MAX_JOBS=4
+ARG MAX_JOBS=2
 
 # Shallow clone — saves bandwidth + disk on the Cloud Build worker.
 RUN git clone --depth=1 --branch "${VLLM_BRANCH}" "${VLLM_REPO}" /workspace/vllm
@@ -81,8 +86,19 @@ RUN git clone --depth=1 --branch "${VLLM_BRANCH}" "${VLLM_REPO}" /workspace/vllm
 # vLLM's setup.py auto-detects ROCm from torch.version.hip and pulls in
 # the right requirements file. --no-build-isolation reuses the torch we
 # just installed instead of resolving a fresh one in the build env.
+#
+# IMPORTANT: vLLM's rocm-build.txt contains
+#   --extra-index-url https://download.pytorch.org/whl/rocm7.1
+#   torch==2.10.0
+# which would resolve torch+rocm7.1, clobbering our rocm7.0 install.
+# Override with --index-url (CLI flag takes precedence over requirements
+# file) to keep all torch-family packages on the rocm7.0 index.
 WORKDIR /workspace/vllm
-RUN uv pip install -r requirements/rocm-build.txt -r requirements/rocm.txt
+RUN uv pip install \
+        -r requirements/rocm-build.txt \
+        -r requirements/rocm.txt \
+        --index-url https://download.pytorch.org/whl/rocm7.0
+RUN python3 -c "import torch; assert 'rocm7.0' in torch.__version__, f'expected rocm7.0, got {torch.__version__}'"
 RUN VLLM_TARGET_DEVICE=rocm \
     MAX_JOBS=${MAX_JOBS} \
     uv pip install -e . --no-build-isolation --verbose
