@@ -17,7 +17,7 @@ FROM ${BASE_IMAGE}
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
-ENV PYTORCH_ROCM_ARCH="gfx942,gfx950"
+ENV PYTORCH_ROCM_ARCH="gfx942;gfx950"
 ENV ROCM_HOME=/opt/rocm
 ENV HIP_PLATFORM=amd
 ENV UV_HTTP_TIMEOUT=600
