@@ -1,0 +1,28 @@
+# Cloud Build config for the combined vLLM + LMCache AMD image.
+#
+# Builds Dockerfile.amd-combined, which compiles both vLLM (cloned from
+# character-tech/vllm cai-v0.19.0) and LMCache (from this repo) against
+# torch 2.10.0+rocm7.0. Image is published to a distinct repo path
+# (lmcache-vllm-amd) so it does not collide with the LMCache-only image.
+#
+# Same private worker pool lifecycle as cloudbuild.yaml — see
+# build_lmcache_amd.sh.
+
+timeout: 10800s
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - build
+      - -f
+      - docker/Dockerfile.amd-combined
+      - -t
+      - 'gcr.io/character-ai/lmcache/lmcache-vllm-amd:${SHORT_SHA}'
+      - -t
+      - 'gcr.io/character-ai/lmcache/lmcache-vllm-amd:dev_${BUILD_ID}'
+      - .
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', '--all-tags', 'gcr.io/character-ai/lmcache/lmcache-vllm-amd']
+
+options:
+  pool:
+    name: 'projects/character-ai/locations/us-central1/workerPools/lmcache-amd-pool'
