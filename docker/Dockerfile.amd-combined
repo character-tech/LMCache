@@ -18,8 +18,8 @@
 #   - rocm/dev-ubuntu-24.04:7.0.2-complete  (ROCm 7.0.2 dev toolkit + hipcc)
 #   - Python 3.12 + uv venv at /opt/venv
 #   - torch 2.10.0+rocm7.0  from https://download.pytorch.org/whl/rocm7.0
-#   - vLLM built from source (cloned from github.com/character-tech/vllm
-#     at branch cai-v0.19.0; auto-detects ROCm via torch.version.hip).
+#   - vLLM built from source (vendored into ./vllm-src by the wrapper
+#     script build_lmcache_vllm_amd.sh; auto-detects ROCm via torch.version.hip).
 #   - LMCache built from source (the build context — typically the
 #     cai-v0.4.4 branch this Dockerfile lives on). BUILD_WITH_HIP=1, hipcc.
 #
@@ -76,12 +76,13 @@ WORKDIR /workspace
 
 #################### Build vLLM from source (cai-v0.19.0) #####################
 
-ARG VLLM_REPO=https://github.com/character-tech/vllm.git
-ARG VLLM_BRANCH=cai-v0.19.0
+# vLLM source is vendored into the build context at ./vllm-src by the
+# wrapper script (build_lmcache_vllm_amd.sh). We use COPY instead of
+# git clone because character-tech/vllm is private and Cloud Build has
+# no GitHub credentials in the build container.
 ARG MAX_JOBS=2
 
-# Shallow clone — saves bandwidth + disk on the Cloud Build worker.
-RUN git clone --depth=1 --branch "${VLLM_BRANCH}" "${VLLM_REPO}" /workspace/vllm
+COPY vllm-src /workspace/vllm
 
 # vLLM's setup.py auto-detects ROCm from torch.version.hip and pulls in
 # the right requirements file. --no-build-isolation reuses the torch we
