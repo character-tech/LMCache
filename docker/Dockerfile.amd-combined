@@ -68,10 +68,11 @@ RUN uv pip install \
         -r requirements/rocm.txt
 RUN python3 -c "import torch; assert 'rocm7.0' in torch.__version__, f'expected rocm7.0, got {torch.__version__}'"
 
-# SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM: git archive strips .git so
-# setuptools-scm cannot infer the version — pin it to the source branch tag.
+# VLLM_VERSION_OVERRIDE: git archive strips .git so setuptools-scm
+# cannot infer the version — vLLM's setup.py reads this env var and
+# pins SETUPTOOLS_SCM_PRETEND_VERSION before calling get_version().
 RUN VLLM_TARGET_DEVICE=rocm MAX_JOBS=${MAX_JOBS} \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM=0.19.0 \
+    VLLM_VERSION_OVERRIDE=0.19.0 \
     uv pip install -e . --no-build-isolation --verbose
 
 RUN python3 -c "import vllm; print('vLLM =', vllm.__version__)"
