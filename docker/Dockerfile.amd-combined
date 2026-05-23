@@ -37,7 +37,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin
 # vLLM ROCm extension build targets MI300X/MI325X (gfx942) + MI350 (gfx950).
-ENV PYTORCH_ROCM_ARCH="gfx942;gfx950"
+ENV PYTORCH_ROCM_ARCH="gfx942,gfx950"
 ENV ROCM_HOME=/opt/rocm
 ENV HIP_PLATFORM=amd
 # uv on Cloud Build hosts is sensitive to large wheel downloads; keep the
