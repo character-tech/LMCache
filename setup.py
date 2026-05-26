@@ -134,6 +134,7 @@ def cuda_extension() -> tuple[list, dict]:
         "csrc/mem_alloc.cpp",
         "csrc/utils.cpp",
         "csrc/event_recorder.cpp",
+        "csrc/completion_recorder.cpp",
     ]
     storage_manager_sources = [
         "csrc/storage_manager/bitmap.cpp",
@@ -212,6 +213,7 @@ def rocm_extension() -> tuple[list, dict]:
         "csrc/mem_alloc_hip.cpp",
         "csrc/utils_hip.cpp",
         "csrc/event_recorder.cpp",
+        "csrc/completion_recorder.cpp",
     ]
     storage_manager_sources = [
         "csrc/storage_manager/bitmap.cpp",
