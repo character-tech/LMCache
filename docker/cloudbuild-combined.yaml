@@ -8,6 +8,17 @@
 # Same private worker pool lifecycle as cloudbuild.yaml — see
 # build_lmcache_amd.sh.
 
+# Substitutions (passed by build_lmcache_vllm_amd.sh):
+#   _VLLM_VER    — vllm version slug (e.g. 0.19.0)
+#   _LMCACHE_VER — LMCache version slug (e.g. 0.4.4)
+#   _ROCM_VER    — base ROCm version (e.g. rocm7.0.2)
+#   _TORCH_VER   — torch wheel version (e.g. torch2.10.0)
+substitutions:
+  _VLLM_VER: 'unknown'
+  _LMCACHE_VER: 'unknown'
+  _ROCM_VER: 'rocm7.0.2'
+  _TORCH_VER: 'torch2.10.0'
+
 timeout: 10800s
 steps:
   - name: 'gcr.io/cloud-builders/docker'
@@ -19,6 +30,8 @@ steps:
       - 'gcr.io/character-ai/lmcache/lmcache-vllm-amd:${SHORT_SHA}'
       - -t
       - 'gcr.io/character-ai/lmcache/lmcache-vllm-amd:dev_${BUILD_ID}'
+      - -t
+      - 'gcr.io/character-ai/lmcache/lmcache-vllm-amd:vllm-${_VLLM_VER}-lmcache-${_LMCACHE_VER}-${_ROCM_VER}-${_TORCH_VER}-${SHORT_SHA}'
       - .
   - name: 'gcr.io/cloud-builders/docker'
     args: ['push', '--all-tags', 'gcr.io/character-ai/lmcache/lmcache-vllm-amd']

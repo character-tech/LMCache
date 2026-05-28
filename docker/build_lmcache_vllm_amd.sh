@@ -17,6 +17,12 @@ MACHINE="${MACHINE:-n2d-standard-32}"
 DISK_GB="${DISK_GB:-300}"
 VLLM_SRC="${VLLM_SRC:-$HOME/git/vllm}"
 VLLM_BRANCH="${VLLM_BRANCH:-cai-v0.19.0}"
+# Version slugs used in the descriptive image tag. Derived from branch
+# names by default (cai-v0.19.0 → 0.19.0, cai-v0.4.4 → 0.4.4).
+VLLM_VER="${VLLM_VER:-${VLLM_BRANCH#cai-v}}"
+LMCACHE_VER="${LMCACHE_VER:-0.4.4}"
+ROCM_VER="${ROCM_VER:-rocm7.0.2}"
+TORCH_VER="${TORCH_VER:-torch2.10.0}"
 
 LMCACHE_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 SHORT_SHA="$(git -C "${LMCACHE_ROOT}" rev-parse --short HEAD)"
@@ -56,11 +62,12 @@ gcloud builds worker-pools create "${POOL}" \
   --worker-machine-type="${MACHINE}" \
   --worker-disk-size="${DISK_GB}"
 
-echo "Submitting build (SHORT_SHA=${SHORT_SHA}) ..."
+DESCRIPTIVE_TAG="vllm-${VLLM_VER}-lmcache-${LMCACHE_VER}-${ROCM_VER}-${TORCH_VER}-${SHORT_SHA}"
+echo "Submitting build (SHORT_SHA=${SHORT_SHA}, descriptive tag: ${DESCRIPTIVE_TAG}) ..."
 cd "${LMCACHE_ROOT}"
 gcloud builds submit \
   --config=docker/cloudbuild-combined.yaml \
-  --substitutions="SHORT_SHA=${SHORT_SHA}" \
+  --substitutions="SHORT_SHA=${SHORT_SHA},_VLLM_VER=${VLLM_VER},_LMCACHE_VER=${LMCACHE_VER},_ROCM_VER=${ROCM_VER},_TORCH_VER=${TORCH_VER}" \
   --project="${PROJECT}" \
   --region="${REGION}" \
   .
