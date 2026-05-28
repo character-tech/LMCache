@@ -128,10 +128,8 @@ RUN TORCH_DONT_CHECK_COMPILER_ABI=1 \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_LMCACHE=0.0.0+amd \
     uv pip install -e . --no-build-isolation --verbose
 
-# Smoke-check that the HIP .so was built. Cloud Build workers are CPU-only,
-# so lmcache.__init__'s torch.cuda.is_available() gate falls back to the
-# Python stub — we can't import lmcache.c_ops here. Verify the .so exists
-# instead; it will load at runtime on the MI350 nodes.
+# File-existence check (Cloud Build is CPU-only; lmcache.c_ops import
+# falls back to Python stub when torch.cuda.is_available() is False).
 RUN ls -l /workspace/LMCache/lmcache/c_ops*.so
 
 WORKDIR /workspace
