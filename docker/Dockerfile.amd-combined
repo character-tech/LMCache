@@ -132,5 +132,8 @@ RUN TORCH_DONT_CHECK_COMPILER_ABI=1 \
 # falls back to Python stub when torch.cuda.is_available() is False).
 RUN ls -l /workspace/LMCache/lmcache/c_ops*.so
 
-WORKDIR /workspace
+# /workspace would put '/workspace' on sys.path's '' (cwd) entry; that
+# turns the vllm/ source-tree dir into an implicit namespace package and
+# shadows the editable install, breaking `from vllm import SamplingParams`.
+WORKDIR /
 ENTRYPOINT ["lmcache", "server"]
