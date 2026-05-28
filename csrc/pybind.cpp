@@ -30,6 +30,7 @@ PYBIND11_MODULE(c_ops, m) {
       .value("NL_X_NBBS_ONE_HS", GPUKVFormat::NL_X_NBBS_ONE_HS)
       .value("NL_X_TWO_NB_NH_BS_HS", GPUKVFormat::NL_X_TWO_NB_NH_BS_HS)
       .value("NL_X_NB_TWO_NH_BS_HS", GPUKVFormat::NL_X_NB_TWO_NH_BS_HS)
+      .value("NB_NL_TWO_NH_BS_HS", GPUKVFormat::NB_NL_TWO_NH_BS_HS)
       .export_values();
   m.def("multi_layer_kv_transfer", &multi_layer_kv_transfer,
         py::arg("key_value"), py::arg("key_value_ptrs"),
@@ -88,7 +89,9 @@ PYBIND11_MODULE(c_ops, m) {
       .def_readwrite("bs", &PageBufferShapeDesc::bs)
       .def_readwrite("nh", &PageBufferShapeDesc::nh)
       .def_readwrite("hs", &PageBufferShapeDesc::hs)
-      .def_readwrite("element_size", &PageBufferShapeDesc::element_size);
+      .def_readwrite("element_size", &PageBufferShapeDesc::element_size)
+      .def_readwrite("block_stride_elems",
+                     &PageBufferShapeDesc::block_stride_elems);
   m.def("record_event_on_stream", &record_event_on_stream,
         py::arg("cuda_stream_ptr"), py::arg("event_type_name"),
         py::arg("session_id"), py::arg("str_metadata"), py::arg("int_metadata"),
@@ -97,17 +100,13 @@ PYBIND11_MODULE(c_ops, m) {
   m.def("record_completion_on_stream", &record_completion_on_stream,
         py::arg("cuda_stream_ptr"), py::arg("kind"), py::arg("payload"),
         py::call_guard<py::gil_scoped_release>());
-  // Return each payload item as py::bytes; pybind11 utf-8-decodes std::string
-  // by default, corrupting binary payloads (e.g. pickle, msgpack).
+  // Return each payload as py::bytes; pybind11 utf-8-decodes std::string
+  // by default, corrupting binary payloads (e.g. msgpack).
   m.def("drain_recorded_completions", []() {
     auto items = drain_recorded_completions();
     py::list out;
     for (auto& kv : items) {
-      py::list payload;
-      for (auto& s : kv.second) {
-        payload.append(py::bytes(s));
-      }
-      out.append(py::make_tuple(py::str(kv.first), payload));
+      out.append(py::make_tuple(py::str(kv.first), py::bytes(kv.second)));
     }
     return out;
   });
