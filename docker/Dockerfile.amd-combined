@@ -79,17 +79,21 @@ RUN uv pip install \
 RUN python3 -c "import torch; assert 'rocm7.0' in torch.__version__, f'expected rocm7.0, got {torch.__version__}'"
 
 # Remove `triton-rocm` now that upstream `triton` has been installed by
-# vLLM's requirements/rocm.txt. Having both packages in the same `triton/`
-# namespace ships a libtriton.so with bundled HIP/comgr libs that conflict
-# with the system ROCm runtime — at runtime, the aiter blockscale Triton
-# kernel crashes at `make_ttgir` with `RuntimeError: PassManager::run failed`
-# when VLLM_ROCM_USE_AITER_LINEAR=1 (the default). Validated in the
+# vLLM's requirements/rocm-build.txt. Having both packages in the same
+# `triton/` namespace ships a libtriton.so with bundled HIP/comgr libs that
+# conflict with the system ROCm runtime — at runtime, the aiter blockscale
+# Triton kernel crashes at `make_ttgir` with `RuntimeError: PassManager::run
+# failed` when VLLM_ROCM_USE_AITER_LINEAR=1 (the default). Validated in the
 # dev-deepseek-v3-mp-test dev pod: with only upstream `triton` loaded, vLLM
 # starts cleanly with AITER_LINEAR defaulting to 1.
-RUN uv pip list | awk '$1 == "triton-rocm" {found=1} END {exit !found}' \
-        && uv pip uninstall triton-rocm \
-        || echo "triton-rocm not installed, skipping"
-RUN python3 -c "import triton; print('triton:', triton.__version__, triton.__file__)"
+#
+# Note: `triton` and `triton-rocm` overwrite each other's files in the
+# shared `triton/` namespace dir. Uninstalling one leaves dangling state,
+# so we follow up with a force-reinstall of upstream `triton==3.6.0` to
+# restore any shared files removed by the uninstall.
+RUN uv pip uninstall triton-rocm && \
+    uv pip install --reinstall --no-deps triton==3.6.0 && \
+    python3 -c "import triton; print('triton:', triton.__version__, triton.__file__)"
 
 # VLLM_VERSION_OVERRIDE: git archive strips .git so setuptools-scm
 # cannot infer the version — vLLM's setup.py reads this env var and
