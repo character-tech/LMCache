@@ -78,23 +78,6 @@ RUN uv pip install \
         -r requirements/rocm.txt
 RUN python3 -c "import torch; assert 'rocm7.0' in torch.__version__, f'expected rocm7.0, got {torch.__version__}'"
 
-# Remove `triton-rocm` now that upstream `triton` has been installed by
-# vLLM's requirements/rocm-build.txt. Having both packages in the same
-# `triton/` namespace ships a libtriton.so with bundled HIP/comgr libs that
-# conflict with the system ROCm runtime — at runtime, the aiter blockscale
-# Triton kernel crashes at `make_ttgir` with `RuntimeError: PassManager::run
-# failed` when VLLM_ROCM_USE_AITER_LINEAR=1 (the default). Validated in the
-# dev-deepseek-v3-mp-test dev pod: with only upstream `triton` loaded, vLLM
-# starts cleanly with AITER_LINEAR defaulting to 1.
-#
-# Note: `triton` and `triton-rocm` overwrite each other's files in the
-# shared `triton/` namespace dir. Uninstalling one leaves dangling state,
-# so we follow up with a force-reinstall of upstream `triton==3.6.0` to
-# restore any shared files removed by the uninstall.
-RUN uv pip uninstall triton-rocm && \
-    uv pip install --reinstall --no-deps triton==3.6.0 && \
-    python3 -c "import triton; print('triton:', triton.__version__, triton.__file__)"
-
 # VLLM_VERSION_OVERRIDE: git archive strips .git so setuptools-scm
 # cannot infer the version — vLLM's setup.py reads this env var and
 # pins SETUPTOOLS_SCM_PRETEND_VERSION before calling get_version().
@@ -103,6 +86,27 @@ RUN VLLM_TARGET_DEVICE=rocm MAX_JOBS=${MAX_JOBS} \
     uv pip install -e . --no-build-isolation --verbose
 
 RUN python3 -c "import vllm; print('vLLM =', vllm.__version__)"
+
+# Remove the bundled HIP/comgr libraries that triton-rocm shipped under
+# triton/backends/amd/lib/. At runtime, having these .so files alongside
+# upstream `triton` causes the aiter blockscale Triton kernel to crash at
+# `make_ttgir` with `RuntimeError: PassManager::run failed` when
+# VLLM_ROCM_USE_AITER_LINEAR=1 (the default). Validated in the
+# dev-deepseek-v3-mp-test dev pod: with these libs removed, vLLM starts
+# cleanly past Triton compilation with AITER_LINEAR defaulting to 1.
+#
+# We intentionally leave both `triton` and `triton-rocm` packages
+# registered in uv's metadata to avoid forcing a torch resolver bump
+# (triton-rocm satisfies a transitive `triton != 3.6.0` constraint from
+# vLLM's setup.py that would otherwise pull torch to 2.12.0+cu130).
+# Only the bundled libs are deleted; the dist-info entries stay so the
+# resolver still sees both packages. We do this *after* the vLLM install
+# step in case vLLM's setup re-touches the triton namespace.
+RUN BUNDLED_LIB_DIR=/opt/venv/lib/python3.12/site-packages/triton/backends/amd/lib && \
+    ls -la "$BUNDLED_LIB_DIR" && \
+    find "$BUNDLED_LIB_DIR" -maxdepth 1 -name '*.so' -print -delete && \
+    echo "After cleanup:" && ls -la "$BUNDLED_LIB_DIR" && \
+    python3 -c "import triton; print('triton:', triton.__version__, triton.__file__)"
 
 #################### flash_attn (triton-AMD backend) #########################
 
