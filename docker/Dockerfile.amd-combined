@@ -51,19 +51,10 @@ RUN uv pip install \
         "torch==2.10.0+rocm7.0" && \
     python3 -c "import torch; assert torch.version.hip; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
-# The rocm7.0 torch wheel pulls in `triton-rocm` as a dependency, which
-# installs into the same `triton/` namespace as the upstream `triton` wheel.
-# When both are present, the shipped libtriton.so from triton-rocm bundles
-# its own HIP/comgr libraries; combined with VLLM_ROCM_USE_AITER_LINEAR=1
-# (the default), the aiter blockscale Triton kernel crashes at
-# `make_ttgir` with `RuntimeError: PassManager::run failed`.
-# Remove `triton-rocm` so only the upstream `triton` wheel is loaded.
-# Use a tolerant check — if triton-rocm isn't installed (future torch wheel
-# may not pull it in), the script still succeeds.
-RUN uv pip list | awk '$1 == "triton-rocm" {found=1} END {exit !found}' \
-        && uv pip uninstall triton-rocm \
-        || echo "triton-rocm not installed, skipping" && \
-    python3 -c "import triton; print('triton:', triton.__version__, triton.__file__)"
+# NOTE: triton-rocm is uninstalled later, after vLLM's requirements/rocm.txt
+# step pulls in upstream `triton`. We can't do it here — at this point only
+# `triton-rocm` is installed, so removing it would leave no Triton at all.
+# See the "Remove triton-rocm" RUN step after vLLM requirements below.
 
 WORKDIR /workspace
 
@@ -86,6 +77,19 @@ RUN uv pip install \
         -r requirements/rocm-build.txt \
         -r requirements/rocm.txt
 RUN python3 -c "import torch; assert 'rocm7.0' in torch.__version__, f'expected rocm7.0, got {torch.__version__}'"
+
+# Remove `triton-rocm` now that upstream `triton` has been installed by
+# vLLM's requirements/rocm.txt. Having both packages in the same `triton/`
+# namespace ships a libtriton.so with bundled HIP/comgr libs that conflict
+# with the system ROCm runtime — at runtime, the aiter blockscale Triton
+# kernel crashes at `make_ttgir` with `RuntimeError: PassManager::run failed`
+# when VLLM_ROCM_USE_AITER_LINEAR=1 (the default). Validated in the
+# dev-deepseek-v3-mp-test dev pod: with only upstream `triton` loaded, vLLM
+# starts cleanly with AITER_LINEAR defaulting to 1.
+RUN uv pip list | awk '$1 == "triton-rocm" {found=1} END {exit !found}' \
+        && uv pip uninstall triton-rocm \
+        || echo "triton-rocm not installed, skipping"
+RUN python3 -c "import triton; print('triton:', triton.__version__, triton.__file__)"
 
 # VLLM_VERSION_OVERRIDE: git archive strips .git so setuptools-scm
 # cannot infer the version — vLLM's setup.py reads this env var and
