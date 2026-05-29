@@ -51,6 +51,20 @@ RUN uv pip install \
         "torch==2.10.0+rocm7.0" && \
     python3 -c "import torch; assert torch.version.hip; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
+# The rocm7.0 torch wheel pulls in `triton-rocm` as a dependency, which
+# installs into the same `triton/` namespace as the upstream `triton` wheel.
+# When both are present, the shipped libtriton.so from triton-rocm bundles
+# its own HIP/comgr libraries; combined with VLLM_ROCM_USE_AITER_LINEAR=1
+# (the default), the aiter blockscale Triton kernel crashes at
+# `make_ttgir` with `RuntimeError: PassManager::run failed`.
+# Remove `triton-rocm` so only the upstream `triton` wheel is loaded.
+# Use a tolerant check — if triton-rocm isn't installed (future torch wheel
+# may not pull it in), the script still succeeds.
+RUN uv pip list | awk '$1 == "triton-rocm" {found=1} END {exit !found}' \
+        && uv pip uninstall triton-rocm \
+        || echo "triton-rocm not installed, skipping" && \
+    python3 -c "import triton; print('triton:', triton.__version__, triton.__file__)"
+
 WORKDIR /workspace
 
 #################### vLLM (cai-v0.19.0, from ./vllm-src) #####################
