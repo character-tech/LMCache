@@ -11,8 +11,18 @@
 # Entrypoint defaults to `lmcache server` (drop-in for the operator
 # DaemonSet); override `command:` in the vLLM pod to `vllm serve`.
 
+# Stage 1: pull AMD-patched Triton wheel. PyPI triton 3.6.0 (vLLM's
+# default) crashes aiter gemm_a8w8_blockscale at TritonAMDGPUCanonicalize-
+# Pointers when VLLM_ROCM_USE_AITER_LINEAR=1. AMD's 3.5.1+rocm7.0.2 works.
+ARG TRITON_WHEEL_IMAGE=rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
+FROM ${TRITON_WHEEL_IMAGE} AS triton_wheel_source
+
 ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:7.0.2-complete
 FROM ${BASE_IMAGE}
+
+COPY --from=triton_wheel_source \
+    /triton-3.5.1+rocm7.0.2.gita272dfa8-cp312-cp312-linux_x86_64.whl \
+    /opt/triton-amd-patched.whl
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
@@ -51,11 +61,6 @@ RUN uv pip install \
         "torch==2.10.0+rocm7.0" && \
     python3 -c "import torch; assert torch.version.hip; print('TORCH=', torch.__version__, 'HIP=', torch.version.hip)"
 
-# NOTE: triton-rocm is uninstalled later, after vLLM's requirements/rocm.txt
-# step pulls in upstream `triton`. We can't do it here — at this point only
-# `triton-rocm` is installed, so removing it would leave no Triton at all.
-# See the "Remove triton-rocm" RUN step after vLLM requirements below.
-
 WORKDIR /workspace
 
 #################### vLLM (cai-v0.19.0, from ./vllm-src) #####################
@@ -87,26 +92,13 @@ RUN VLLM_TARGET_DEVICE=rocm MAX_JOBS=${MAX_JOBS} \
 
 RUN python3 -c "import vllm; print('vLLM =', vllm.__version__)"
 
-# Remove the bundled HIP/comgr libraries that triton-rocm shipped under
-# triton/backends/amd/lib/. At runtime, having these .so files alongside
-# upstream `triton` causes the aiter blockscale Triton kernel to crash at
-# `make_ttgir` with `RuntimeError: PassManager::run failed` when
-# VLLM_ROCM_USE_AITER_LINEAR=1 (the default). Validated in the
-# dev-deepseek-v3-mp-test dev pod: with these libs removed, vLLM starts
-# cleanly past Triton compilation with AITER_LINEAR defaulting to 1.
-#
-# We intentionally leave both `triton` and `triton-rocm` packages
-# registered in uv's metadata to avoid forcing a torch resolver bump
-# (triton-rocm satisfies a transitive `triton != 3.6.0` constraint from
-# vLLM's setup.py that would otherwise pull torch to 2.12.0+cu130).
-# Only the bundled libs are deleted; the dist-info entries stay so the
-# resolver still sees both packages. We do this *after* the vLLM install
-# step in case vLLM's setup re-touches the triton namespace.
-RUN BUNDLED_LIB_DIR=/opt/venv/lib/python3.12/site-packages/triton/backends/amd/lib && \
-    ls -la "$BUNDLED_LIB_DIR" && \
-    find "$BUNDLED_LIB_DIR" -maxdepth 1 -name '*.so' -print -delete && \
-    echo "After cleanup:" && ls -la "$BUNDLED_LIB_DIR" && \
-    python3 -c "import triton; print('triton:', triton.__version__, triton.__file__)"
+# Overwrite PyPI triton 3.6.0 with AMD-patched 3.5.1 wheel (see stage 1).
+# --no-deps keeps triton-rocm package metadata so vLLM's resolver doesn't
+# pull torch to a CUDA build to satisfy `triton != 3.6.0` constraint.
+RUN uv pip install --force-reinstall --no-deps /opt/triton-amd-patched.whl && \
+    python3 -c "import triton; print('triton:', triton.__version__, triton.__file__); \
+                assert '3.5.1' in triton.__version__ and 'rocm7.0.2' in triton.__version__, \
+                f'expected AMD-patched 3.5.1+rocm7.0.2, got {triton.__version__}'"
 
 #################### flash_attn (triton-AMD backend) #########################
 
