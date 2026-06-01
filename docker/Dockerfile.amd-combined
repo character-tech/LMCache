@@ -15,9 +15,10 @@
 # default) crashes aiter gemm_a8w8_blockscale at TritonAMDGPUCanonicalize-
 # Pointers when VLLM_ROCM_USE_AITER_LINEAR=1. AMD's 3.5.1+rocm7.0.2 works.
 ARG TRITON_WHEEL_IMAGE=rocm/pytorch:rocm7.0.2_ubuntu24.04_py3.12_pytorch_release_2.9.1
+ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:7.0.2-complete
+
 FROM ${TRITON_WHEEL_IMAGE} AS triton_wheel_source
 
-ARG BASE_IMAGE=rocm/dev-ubuntu-24.04:7.0.2-complete
 FROM ${BASE_IMAGE}
 
 COPY --from=triton_wheel_source \
