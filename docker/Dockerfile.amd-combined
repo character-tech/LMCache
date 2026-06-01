@@ -23,7 +23,7 @@ FROM ${BASE_IMAGE}
 
 COPY --from=triton_wheel_source \
     /triton-3.5.1+rocm7.0.2.gita272dfa8-cp312-cp312-linux_x86_64.whl \
-    /opt/triton-amd-patched.whl
+    /opt/
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV VIRTUAL_ENV=/opt/venv
@@ -96,7 +96,8 @@ RUN python3 -c "import vllm; print('vLLM =', vllm.__version__)"
 # Overwrite PyPI triton 3.6.0 with AMD-patched 3.5.1 wheel (see stage 1).
 # --no-deps keeps triton-rocm package metadata so vLLM's resolver doesn't
 # pull torch to a CUDA build to satisfy `triton != 3.6.0` constraint.
-RUN uv pip install --force-reinstall --no-deps /opt/triton-amd-patched.whl && \
+RUN uv pip install --force-reinstall --no-deps \
+        /opt/triton-3.5.1+rocm7.0.2.gita272dfa8-cp312-cp312-linux_x86_64.whl && \
     python3 -c "import triton; print('triton:', triton.__version__, triton.__file__); \
                 assert '3.5.1' in triton.__version__ and 'rocm7.0.2' in triton.__version__, \
                 f'expected AMD-patched 3.5.1+rocm7.0.2, got {triton.__version__}'"
