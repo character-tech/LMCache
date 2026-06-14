@@ -16,10 +16,11 @@ A subset of routes defined under
 ``lmcache/v1/internal_api_server/common/`` is also exposed on this HTTP
 server. The module
 ``lmcache/v1/multiprocess/http_apis/common_api.py`` aggregates those
-routers (skipping modules listed in ``_MP_INCOMPATIBLE_MODULES``, such as
-``run_script_api``) and forwards them to the auto-discovery pipeline.
-Adding a new compatible module under ``internal_api_server/common``
-therefore requires no wiring changes on the MP side.
+routers (skipping any module listed in ``_MP_INCOMPATIBLE_MODULES``,
+which is currently empty) and forwards them to the auto-discovery
+pipeline. Adding a new compatible module under
+``internal_api_server/common`` therefore requires no wiring changes on
+the MP side.
 
 .. contents::
    :local:
@@ -82,16 +83,30 @@ compatibility with the vLLM-embedded API server.
      - ``/clear-cache``
      - Force-clear all KV data in L1 (CPU) memory.
    * - GET
-     - ``/api/quota``
+     - ``/reconfigure/backends``
+     - List backend strings accepted by runtime reconfiguration routes.
+   * - GET
+     - ``/reconfigure/{backend}/status``
+     - Report runtime-manageable L2 adapters for one backend type.
+   * - POST
+     - ``/reconfigure/{backend}/{operation}``
+     - Apply one runtime reconfiguration operation to a backend adapter.
+   * - GET
+     - ``/kvcache/check``
+     - Compute MD5 checksums over the GPU KV cache for a set of block IDs.
+       Intended for diagnostics and round-trip integrity checks from
+       ``lmcache bench server``.
+   * - GET
+     - ``/quota``
      - List every registered ``cache_salt`` quota with live usage.
    * - PUT
-     - ``/api/quota/{cache_salt}``
+     - ``/quota/{cache_salt}``
      - Set or update the quota (in GB) for a ``cache_salt``.
    * - GET
-     - ``/api/quota/{cache_salt}``
+     - ``/quota/{cache_salt}``
      - Read the quota and live usage for a single ``cache_salt``.
    * - DELETE
-     - ``/api/quota/{cache_salt}``
+     - ``/quota/{cache_salt}``
      - Remove a ``cache_salt``'s quota entry (its data is evicted next
        cycle).
    * - GET
@@ -131,6 +146,10 @@ compatibility with the vLLM-embedded API server.
    * - GET
      - ``/periodic-threads-health``
      - Quick health check for critical/high-level periodic threads.
+   * - POST
+     - ``/run_script``
+     - Execute an uploaded Python script in a restricted sandbox. Only
+       modules listed in ``--script-allowed-imports`` can be imported.
 
 ``GET /``
 ~~~~~~~~~
@@ -217,7 +236,7 @@ prefetch jobs. Intended for operators and debugging, not for monitoring
 
     {
       "is_healthy": true,
-      "engine_type": "MPCacheEngine",
+"engine_type": "MPCacheServer",
       "chunk_size": 256,
       "hash_algorithm": "builtin-hash",
       "registered_gpu_ids": [0, 1],
@@ -227,16 +246,25 @@ prefetch jobs. Intended for operators and debugging, not for monitoring
           "world_size": 1,
           "kv_cache_layout": {
             "num_layers": 32,
-            "block_size": 16,
-            "hidden_dim_sizes": "...",
-            "dtype": "torch.bfloat16",
-            "is_mla": false,
             "num_blocks": 12345,
-            "gpu_kv_format": "...",
-            "gpu_kv_shape": "...",
-            "gpu_kv_concrete_shape": "...",
-            "attention_backend": "...",
-            "cache_size_per_token": 131072
+            "cache_size_per_token": 131072,
+            "kernel_groups": [
+              {
+                "kernel_group_idx": 0,
+                "engine_group_idx": 0,
+                "object_group_idx": 0,
+                "num_layers": 32,
+                "layer_indices": [0, 1, "..."],
+                "tokens_per_block": 16,
+                "slots_per_block": 16,
+                "dtype": "torch.bfloat16",
+                "gpu_kv_concrete_shape": "...",
+                "is_mla": false,
+                "gpu_kv_format": "...",
+                "gpu_kv_shape": "...",
+                "attention_backend": "..."
+              }
+            ]
           }
         }
       },
@@ -299,9 +327,106 @@ The request body is ignored.
 
     curl -s -X POST http://localhost:8080/clear-cache
 
+.. _mp-http-dax-api:
+
+``/reconfigure/{backend}`` — runtime L2 adapter reconfiguration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+These endpoints are available when the server has a runtime-reconfigurable L2
+adapter. They only change LMCache runtime mappings and metadata; backend
+resources such as DAX device paths must already exist and be readable and
+writable by the server. The endpoint routes ``backend``, ``operation``, and the
+JSON request body into the generic L2 adapter reconfiguration API, while
+backend-specific validation and migration semantics stay inside the adapter.
+
+Use ``GET /reconfigure/backends`` to list the backend strings that can be used
+in ``/reconfigure/{backend}/status`` and
+``/reconfigure/{backend}/{operation}``.
+If an L2 adapter is wrapped by serde, the backend string is still the configured
+L2 adapter type, not the serde wrapper type.
+
+For Device-DAX, use ``backend=dax``. DAX operations use JSON request bodies
+because DAX paths contain slashes. ``add`` and ``resize`` accept ``size`` as an
+integer byte count or a string such as ``"100GiB"``. ``remove`` supports
+``migrate``, ``evict``, and ``drain``; ``resize`` supports ``migrate`` and
+``evict``.
+
+See :doc:`/kv_cache/storage_backends/dax` for detailed request examples,
+mode semantics, and validation guidance.
+
+``GET /kvcache/check``
+~~~~~~~~~~~~~~~~~~~~~~
+
+Compute MD5 checksums over the GPU KV cache, grouped ``chunk_size`` blocks
+per hashed chunk. MP mode addresses KV storage by block IDs natively (the
+same units used by ``STORE`` / ``RETRIEVE``), so the endpoint is fully
+block-centric: ``block_ids`` enumerates the target blocks and
+``chunk_size`` counts blocks per chunk. Intended for diagnostics and
+round-trip integrity checks from ``lmcache bench server`` — not for the
+inference data path.
+
+**Query parameters:**
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 15 60
+
+   * - Name
+     - Required
+     - Description
+   * - ``block_ids``
+     - yes
+     - GPU block IDs in mixed format, e.g. ``"0,[2,5],8"``.
+   * - ``chunk_size``
+     - yes
+     - Positive integer — number of blocks per hashed chunk.
+   * - ``instance_id``
+     - no (default ``0``)
+     - Registered GPU context ID on the engine.
+   * - ``layerwise``
+     - no (default ``false``)
+     - If ``true``, return per-layer checksums keyed by ``"layer_<idx>"``;
+       otherwise a single aggregated digest per chunk over all layers.
+
+**Response** (``200 OK``):
+
+.. code-block:: json
+
+    {
+      "status": "success",
+      "chunk_size": 2,
+      "num_chunks": 2,
+      "chunk_checksums": ["<md5>", "<md5>"],
+      "layerwise": false,
+      "block_id_ranges": "0,[2,5],8"
+    }
+
+When ``layerwise=true``, ``chunk_checksums`` is a dict keyed by
+``"layer_<idx>"`` whose values are per-layer lists.
+
+**HTTP status codes:**
+
+- ``200``: success.
+- ``400``: ``block_ids`` missing/malformed, or ``chunk_size`` missing or
+  non-positive.
+- ``404``: ``instance_id`` not registered, or the registered KV tensors
+  are empty.
+- ``501``: engine has no ``gpu_contexts``, or the GPU KV format is not
+  supported by this endpoint (page-buffer-fused and cross-layer layouts
+  are declined until a real need appears).
+- ``503``: engine not yet initialized on ``app.state``.
+
+**Example:**
+
+.. code-block:: bash
+
+    curl -s "http://localhost:8080/kvcache/check?block_ids=0,1,2,3&chunk_size=2"
+
+    curl -s "http://localhost:8080/kvcache/check?block_ids=0,1,2,3&chunk_size=2&layerwise=true"
+
 .. _mp-http-quota-api:
 
-``/api/quota`` — per-``cache_salt`` quota management
+``/quota`` — per-``cache_salt`` quota management
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 These endpoints manage the per-``cache_salt`` storage budgets consumed by
@@ -318,13 +443,13 @@ present, but the LRU policy ignores the registered quotas.
 
 **URL escaping for the empty salt.** ``cache_salt=""`` (un-salted /
 anonymous traffic) cannot appear in a URL path parameter, so the API
-accepts the sentinel ``_default`` in its place. ``PUT /api/quota/_default``
+accepts the sentinel ``_default`` in its place. ``PUT /quota/_default``
 sets the quota for ``cache_salt=""``. A user that legitimately stores
 data with ``cache_salt="_default"`` cannot be managed via this HTTP API
 distinctly from anonymous traffic — both map to the same path parameter;
 pick any other value (e.g. ``"default"``) to disambiguate.
 
-``PUT /api/quota/{cache_salt}``
+``PUT /quota/{cache_salt}``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Create or update a quota.
@@ -345,11 +470,11 @@ engine is not initialized.
 
 .. code-block:: bash
 
-    curl -s -X PUT http://localhost:8080/api/quota/alice \
+    curl -s -X PUT http://localhost:8080/quota/alice \
         -H 'Content-Type: application/json' \
         -d '{"limit_gb": 10.0}'
 
-``GET /api/quota/{cache_salt}``
+``GET /quota/{cache_salt}``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Read the current quota and live usage for one ``cache_salt``.
@@ -370,7 +495,7 @@ Read the current quota and live usage for one ``cache_salt``.
 reflects whatever bytes are currently cached for that salt — those bytes
 will evict next cycle under ``IsolatedLRU``).
 
-``DELETE /api/quota/{cache_salt}``
+``DELETE /quota/{cache_salt}``
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 Remove a ``cache_salt``'s quota entry. Any bytes still cached under this
@@ -386,7 +511,7 @@ limit drops to ``0``) and will be evicted.
 When no quota was registered for the given ``cache_salt``, the response
 is ``{"cache_salt": "...", "status": "not_found"}`` (still ``200 OK``).
 
-``GET /api/quota``
+``GET /quota``
 ^^^^^^^^^^^^^^^^^^
 
 List every registered quota alongside its live usage.
@@ -706,9 +831,9 @@ registration list to edit.
 If the route is generic enough to be shared with the vLLM-embedded API
 server, add it under ``lmcache/v1/internal_api_server/common/`` instead.
 It will be picked up on the MP side via ``common_api.py`` unless its
-module name is listed in ``_MP_INCOMPATIBLE_MODULES`` there (used for
-modules that require vLLM-specific ``app.state`` attributes, e.g.
-``run_script_api``).
+module name is listed in ``_MP_INCOMPATIBLE_MODULES`` there (reserved
+for modules that require vLLM-specific ``app.state`` attributes; the
+list is currently empty).
 
 When adding a new endpoint, please also add a matching section to this
 page documenting the endpoint's purpose, request/response schema, and
