@@ -420,6 +420,10 @@ def _allocate_cpu_memory(
     if size == 0:
         return torch.empty(0, dtype=torch.uint8)
 
+    # pinned alloc: enables non_blocking H2D in broadcast sender
+    if numa_mapping is None and shm_name is None:
+        return torch.empty(size, dtype=torch.uint8, pin_memory=True)
+
     alloc_info, _ = _resolve_pinned_alloc_free(
         numa_mapping,
         shm_name,
@@ -442,6 +446,10 @@ def _free_cpu_memory(
 ) -> None:
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+
+    # torch-managed pinned buffer: skip lmc_ops free, let GC handle it
+    if numa_mapping is None and shm_name is None:
+        return
 
     _, free_info = _resolve_pinned_alloc_free(
         numa_mapping,
