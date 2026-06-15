@@ -1739,7 +1739,7 @@ class LMCacheEngine:
                     or self._send_pool_buf.numel() < need
                     or self._send_pool_buf.device != torch.device(send_device)
                 ):
-                    new_size = max(need, int(1.5 * need))
+                    new_size = int(1.5 * need)
                     self._send_pool_buf = torch.empty(
                         new_size, dtype=raw_tensor.dtype, device=send_device
                     )
@@ -1787,7 +1787,7 @@ class LMCacheEngine:
                     or self._recv_pool_buf.numel() < need
                     or self._recv_pool_buf.device != torch.device(recv_device)
                 ):
-                    new_size = max(need, int(1.5 * need))
+                    new_size = int(1.5 * need)
                     self._recv_pool_buf = torch.empty(
                         new_size, dtype=torch.uint8, device=recv_device
                     )
