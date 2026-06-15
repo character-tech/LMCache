@@ -1074,7 +1074,7 @@ class AddressManager:
             if block.size >= aligned_size:
                 break
         else:
-            logger.warning(
+            logger.debug(
                 "Failed to allocate memory block of size %d "
                 "because no memory is available",
                 size,
