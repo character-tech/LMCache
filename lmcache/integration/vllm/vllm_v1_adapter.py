@@ -1091,7 +1091,7 @@ class LMCacheConnectorV1Impl:
             return getattr(connector, f"{kind}_stream")
         except AttributeError:
             logger.warning(
-                "[v15] gpu_connector has no %s_stream, using current stream for slot_mapping", kind
+                "gpu_connector has no %s_stream, using current stream for slot_mapping", kind
             )
             return torch.cuda.current_stream()
 
@@ -1111,7 +1111,7 @@ class LMCacheConnectorV1Impl:
         n = flat.numel()
         if self._slot_mapping_pinned_buf.numel() < n:
             self._slot_mapping_pinned_buf = torch.empty(n, dtype=slot_mapping.dtype, pin_memory=True)
-            logger.warning("[v15][slot_mapping_to_device] grew pinned buf to %d", n)
+            logger.warning("[slot_mapping_to_device] grew pinned buf to %d", n)
         host_view = self._slot_mapping_pinned_buf[:n]
         host_view.copy_(flat)  # pageable → pinned (CPU-only, no HIP)
         stream = self._get_connector_stream(kind)
@@ -1119,7 +1119,7 @@ class LMCacheConnectorV1Impl:
             dev_tensor = host_view.to(self.device, non_blocking=True)
         elapsed_ms = (time.perf_counter() - _t0) * 1000
         if elapsed_ms > 10:
-            logger.warning("[v15][slot_mapping_to_device] took %.1f ms", elapsed_ms)
+            logger.warning("[slot_mapping_to_device] took %.1f ms", elapsed_ms)
         return dev_tensor.reshape(slot_mapping.shape)
 
     @_lmcache_nvtx_annotate
@@ -1240,7 +1240,7 @@ class LMCacheConnectorV1Impl:
 
         _wfs_ms = (time.perf_counter() - _wfs_t0) * 1000
         if _wfs_ms > 500:
-            logger.warning("[v15][wait_for_save] total=%.1f ms", _wfs_ms)
+            logger.warning("[wait_for_save] total=%.1f ms", _wfs_ms)
 
     @_lmcache_nvtx_annotate
     def get_finished(

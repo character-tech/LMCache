@@ -408,7 +408,7 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         torch.cuda.current_stream().wait_stream(self.load_stream)
         _btg_ms = (time.perf_counter() - _btg_t0) * 1000
         if _btg_ms > 20:
-            logger.warning("[v15][batched_to_gpu] enqueue took %.1f ms n_objs=%s", _btg_ms, n_objs)
+            logger.warning("[batched_to_gpu] enqueue took %.1f ms n_objs=%s", _btg_ms, n_objs)
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
