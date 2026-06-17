@@ -804,7 +804,9 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
-            slot_mapping = self._slot_mapping_to_device(request.slot_mapping, kind="load")
+            slot_mapping = self._slot_mapping_to_device(
+                request.slot_mapping, kind="load"
+            )
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -1095,7 +1097,8 @@ class LMCacheConnectorV1Impl:
             return getattr(connector, f"{kind}_stream")
         except AttributeError:
             logger.warning(
-                "gpu_connector has no %s_stream, using current stream for slot_mapping", kind
+                "gpu_connector has no %s_stream, using current stream for slot_mapping",
+                kind,
             )
             return torch.cuda.current_stream()
 
