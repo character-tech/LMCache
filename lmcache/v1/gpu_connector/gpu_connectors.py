@@ -394,6 +394,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
+        # Note: the per-call store_stream.synchronize() was removed. Callers must
+        # use batched_from_gpu (which adds a single batch-level device fence) rather
+        # than calling from_gpu() directly for non-CUDA targets.
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
@@ -421,7 +424,8 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         # Device-side fence instead of per-memobj CPU-blocking synchronize().
         # Ensures D2H completes before KV pages can be evicted, without stalling
         # the engine thread for each memory object individually.
-        if memory_objs and not next(iter(memory_objs)).tensor.is_cuda:
+        first = next(iter(memory_objs), None)
+        if first is not None and first.tensor is not None and not first.tensor.is_cuda:
             torch.cuda.current_stream().wait_stream(self.store_stream)
 
     def get_shape(self, num_tokens: int) -> torch.Size:

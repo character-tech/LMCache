@@ -1127,6 +1127,11 @@ class LMCacheConnectorV1Impl:
         need = self._slot_mapping_buf_cursor + n
         if self._slot_mapping_pinned_buf.numel() < need:
             new_size = max(need, self._slot_mapping_pinned_buf.numel() * 2)
+            # The old buffer is kept alive by any dev_tensor returned from a
+            # previous iteration in this call (via .to(non_blocking=True) which
+            # holds a reference to its pinned source). Replacing the attribute
+            # here is safe — the old tensor will not be freed until those GPU
+            # copies complete and the returned tensors go out of scope.
             self._slot_mapping_pinned_buf = torch.empty(
                 new_size, dtype=torch.long, pin_memory=True
             )
