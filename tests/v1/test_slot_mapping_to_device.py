@@ -52,11 +52,16 @@ def test_already_on_device():
 
 
 def _run_with_fake_cuda(stub, sm, kind="store"):
-    """Drive _slot_mapping_to_device with CUDA ops patched out."""
-    fake_stream = MagicMock()
+    """Drive _slot_mapping_to_device with CUDA ops patched out.
+
+    Returns (result, stream_ctx_mock) so callers can assert which stream was used.
+    """
+    fake_current_stream = MagicMock()
+    stream_ctx_mock = MagicMock()
     ctx_mgr = MagicMock()
     ctx_mgr.__enter__ = MagicMock(return_value=None)
     ctx_mgr.__exit__ = MagicMock(return_value=False)
+    stream_ctx_mock.return_value = ctx_mgr
 
     original_to = torch.Tensor.to
 
@@ -67,10 +72,11 @@ def _run_with_fake_cuda(stub, sm, kind="store"):
     torch.Tensor.to = fake_to
     try:
         with (
-            patch("torch.cuda.stream", return_value=ctx_mgr),
-            patch("torch.cuda.current_stream", return_value=fake_stream),
+            patch("torch.cuda.stream", stream_ctx_mock),
+            patch("torch.cuda.current_stream", return_value=fake_current_stream),
         ):
-            return stub._slot_mapping_to_device(sm, kind=kind)
+            result = stub._slot_mapping_to_device(sm, kind=kind)
+            return result, stream_ctx_mock
     finally:
         torch.Tensor.to = original_to
 
@@ -97,7 +103,7 @@ def test_cpu_input_fits_buffer():
     # Make stub.device.type "rocm" to force the copy branch.
     stub.device.type = "rocm"
 
-    result = _run_with_fake_cuda(stub, sm, kind="store")
+    result, _ = _run_with_fake_cuda(stub, sm, kind="store")
 
     assert stub._slot_mapping_buf_cursor == 3
     assert list(result.numpy()) == [10, 20, 30]
@@ -111,7 +117,7 @@ def test_cpu_input_buffer_grows():
 
     sm = _cuda_typed_sm([1, 2, 3, 4, 5])
 
-    _run_with_fake_cuda(stub, sm, kind="store")
+    _run_with_fake_cuda(stub, sm, kind="store")  # return value not needed here
 
     assert stub._slot_mapping_pinned_buf.numel() >= 5
     assert stub._slot_mapping_buf_cursor == 5
@@ -123,10 +129,10 @@ def test_cursor_advances_across_calls():
     stub.device = MagicMock()
     stub.device.type = "rocm"
 
-    _run_with_fake_cuda(stub, _cuda_typed_sm([1, 2, 3]), kind="store")
+    _run_with_fake_cuda(stub, _cuda_typed_sm([1, 2, 3]), kind="store")  # return value not needed here
     assert stub._slot_mapping_buf_cursor == 3
 
-    _run_with_fake_cuda(stub, _cuda_typed_sm([4, 5]), kind="store")
+    _run_with_fake_cuda(stub, _cuda_typed_sm([4, 5]), kind="store")  # return value not needed here
     assert stub._slot_mapping_buf_cursor == 5
 
 
@@ -139,7 +145,7 @@ def test_buffer_wraps_when_cursor_exhausts():
 
     sm = _cuda_typed_sm([1, 2, 3])  # needs 3 → triggers growth
 
-    _run_with_fake_cuda(stub, sm, kind="store")
+    _run_with_fake_cuda(stub, sm, kind="store")  # return value not needed here
 
     assert stub._slot_mapping_pinned_buf.numel() >= 3
     # After growth cursor resets to 0 then advances by 3.
@@ -191,3 +197,62 @@ def test_get_connector_stream_returns_correct_stream():
     result = stub._get_connector_stream("store")
 
     assert result is expected_stream
+
+
+def test_kind_load_uses_load_stream():
+    """kind='load' passes load_stream to torch.cuda.stream, not store_stream."""
+    stub = _make_stub(device_type="cpu", buf_size=20)
+    stub.device = MagicMock()
+    stub.device.type = "rocm"
+
+    load_stream = MagicMock(name="load_stream")
+    store_stream = MagicMock(name="store_stream")
+    mock_connector = MagicMock()
+    mock_connector.load_stream = load_stream
+    mock_connector.store_stream = store_stream
+    mock_engine = MagicMock()
+    mock_engine.gpu_connector = mock_connector
+    stub.lmcache_engine = mock_engine
+
+    sm = _cuda_typed_sm([7, 8, 9])
+    _, stream_ctx_mock = _run_with_fake_cuda(stub, sm, kind="load")
+
+    # torch.cuda.stream must have been called with the load_stream, not store_stream.
+    stream_ctx_mock.assert_called_once_with(load_stream)
+
+
+def test_stream_ctx_called_with_correct_store_stream():
+    """kind='store' passes store_stream to torch.cuda.stream."""
+    stub = _make_stub(device_type="cpu", buf_size=20)
+    stub.device = MagicMock()
+    stub.device.type = "rocm"
+
+    store_stream = MagicMock(name="store_stream")
+    mock_connector = MagicMock()
+    mock_connector.store_stream = store_stream
+    mock_engine = MagicMock()
+    mock_engine.gpu_connector = mock_connector
+    stub.lmcache_engine = mock_engine
+
+    sm = _cuda_typed_sm([1, 2])
+    _, stream_ctx_mock = _run_with_fake_cuda(stub, sm, kind="store")
+
+    stream_ctx_mock.assert_called_once_with(store_stream)
+
+
+def test_empty_slot_mapping():
+    """Zero-length slot_mapping: cursor stays 0, returned tensor is also empty."""
+    stub = _make_stub(device_type="cpu", buf_size=16)
+    stub.device = MagicMock()
+    stub.device.type = "rocm"
+
+    real_tensor = torch.tensor([], dtype=torch.long)
+    sm = MagicMock()
+    sm.device.type = "cuda"
+    sm.reshape.return_value = real_tensor
+    sm.shape = real_tensor.shape
+
+    result, _ = _run_with_fake_cuda(stub, sm, kind="store")
+
+    assert stub._slot_mapping_buf_cursor == 0
+    assert result.numel() == 0
