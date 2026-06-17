@@ -1741,7 +1741,7 @@ class LMCacheEngine:
                 ):
                     new_size = int(1.5 * need)
                     self._send_pool_buf = torch.empty(
-                        new_size, dtype=raw_tensor.dtype, device=send_device
+                        new_size, dtype=torch.uint8, device=send_device
                     )
                 tensor_to_broadcast = self._send_pool_buf[
                     self._send_pool_cursor : self._send_pool_cursor + chunk_size

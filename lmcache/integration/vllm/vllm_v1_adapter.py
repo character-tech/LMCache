@@ -566,10 +566,10 @@ class LMCacheConnectorV1Impl:
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
 
-        # v15: pre-allocate pinned bounce buffer for slot_mapping H2D copies
+        # Pre-allocate pinned bounce buffer for slot_mapping H2D copies.
+        # One buffer shared by store and load paths (they don't interleave).
         _prealloc_n = 32768  # covers max tokens per slot_mapping
         self._slot_mapping_pinned_buf = torch.empty(_prealloc_n, dtype=torch.long, pin_memory=True)
-        self._slot_mapping_store_stream = None  # resolved on first call via _ensure_slot_mapping_stream
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -800,7 +800,7 @@ class LMCacheConnectorV1Impl:
 
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = self._slot_mapping_to_device(request.slot_mapping)
+            slot_mapping = self._slot_mapping_to_device(request.slot_mapping, kind="load")
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -1036,7 +1036,7 @@ class LMCacheConnectorV1Impl:
                 assert len(slot_mapping) == len(token_ids)
 
                 # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = self._slot_mapping_to_device(slot_mapping)
+                slot_mapping = self._slot_mapping_to_device(slot_mapping, kind="store")
 
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
@@ -1082,22 +1082,27 @@ class LMCacheConnectorV1Impl:
 
             next(layerwise_storer)
 
-    def _ensure_slot_mapping_stream(self):
-        if self._slot_mapping_store_stream is not None:
-            return self._slot_mapping_store_stream
+    def _get_connector_stream(self, kind: str) -> torch.cuda.Stream:
+        """Return store_stream or load_stream from the gpu_connector, or a
+        fallback stream if the connector doesn't expose one. `kind` is
+        'store' or 'load'."""
         try:
-            connector = self.lmcache_engine.storage_backend.gpu_connector
-            self._slot_mapping_store_stream = connector.store_stream
+            connector = self.lmcache_engine.gpu_connector
+            return getattr(connector, f"{kind}_stream")
         except AttributeError:
-            self._slot_mapping_store_stream = torch.cuda.Stream()
-            logger.warning("[v15] could not find store_stream on gpu_connector, using dedicated stream")
-        return self._slot_mapping_store_stream
+            logger.warning(
+                "[v15] gpu_connector has no %s_stream, using current stream for slot_mapping", kind
+            )
+            return torch.cuda.current_stream()
 
-    def _slot_mapping_to_device(self, slot_mapping):
-        """v15: enqueue slot_mapping H2D on store_stream (not compute stream).
-        store_stream already does wait_stream(current_stream) before every KV transfer,
-        so the copy is ordered before the transfer without fencing the compute stream.
-        Avoids the transitive store_stream.synchronize() pulling in the compute queue.
+    def _slot_mapping_to_device(self, slot_mapping, kind: str = "store"):
+        """Enqueue slot_mapping H2D on the connector's store_stream or load_stream.
+
+        Passing `kind='store'` (default, used by wait_for_save) orders the copy
+        before the D2H KV transfer on store_stream — same stream, so sequential.
+        Passing `kind='load'` (used by start_load_kv) orders the copy before the
+        H2D KV transfer on load_stream — same stream, so sequential.
+        Using the transfer stream avoids fencing the compute stream.
         """
         if slot_mapping.device.type == self.device.type:
             return slot_mapping
@@ -1109,12 +1114,12 @@ class LMCacheConnectorV1Impl:
             logger.warning("[v15][slot_mapping_to_device] grew pinned buf to %d", n)
         host_view = self._slot_mapping_pinned_buf[:n]
         host_view.copy_(flat)  # pageable → pinned (CPU-only, no HIP)
-        store_stream = self._ensure_slot_mapping_stream()
-        with torch.cuda.stream(store_stream):
+        stream = self._get_connector_stream(kind)
+        with torch.cuda.stream(stream):
             dev_tensor = host_view.to(self.device, non_blocking=True)
         elapsed_ms = (time.perf_counter() - _t0) * 1000
         if elapsed_ms > 10:
-            logger.warning('[v15][slot_mapping_to_device] took %.1f ms', elapsed_ms)
+            logger.warning("[v15][slot_mapping_to_device] took %.1f ms", elapsed_ms)
         return dev_tensor.reshape(slot_mapping.shape)
 
     @_lmcache_nvtx_annotate
@@ -1170,7 +1175,7 @@ class LMCacheConnectorV1Impl:
             assert len(slot_mapping) == len(token_ids)
 
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = self._slot_mapping_to_device(slot_mapping)
+            slot_mapping = self._slot_mapping_to_device(slot_mapping, kind="store")
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
