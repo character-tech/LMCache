@@ -567,9 +567,11 @@ class LMCacheConnectorV1Impl:
         self._invalid_block_ids: set[int] = set()
 
         # Pre-allocate pinned bounce buffer for slot_mapping H2D copies.
-        # One buffer shared by store and load paths (they don't interleave).
+        # Cursor-sliced so concurrent requests within one call get non-overlapping
+        # regions; reset at the top of each wait_for_save / start_load_kv call.
         _prealloc_n = vllm_config.scheduler_config.max_num_batched_tokens
         self._slot_mapping_pinned_buf = torch.empty(_prealloc_n, dtype=torch.long, pin_memory=True)
+        self._slot_mapping_buf_cursor: int = 0
 
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
@@ -785,6 +787,7 @@ class LMCacheConnectorV1Impl:
                 continue
             last_idx = idx
 
+        self._slot_mapping_buf_cursor = 0
         for idx, request in enumerate(metadata.requests):
             # Update metrics for all requests that have a load_spec
             if request.load_spec is not None:
@@ -799,7 +802,6 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = self._slot_mapping_to_device(request.slot_mapping, kind="load")
             assert len(tokens) == len(slot_mapping)
 
@@ -1018,6 +1020,7 @@ class LMCacheConnectorV1Impl:
 
         kvcaches = list(self.kv_caches.values())
         is_first = True
+        self._slot_mapping_buf_cursor = 0
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
@@ -1035,7 +1038,6 @@ class LMCacheConnectorV1Impl:
                 assert isinstance(slot_mapping, torch.Tensor)
                 assert len(slot_mapping) == len(token_ids)
 
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
                 slot_mapping = self._slot_mapping_to_device(slot_mapping, kind="store")
 
                 if self.kv_role == "kv_producer":
@@ -1103,16 +1105,30 @@ class LMCacheConnectorV1Impl:
         Passing `kind='load'` (used by start_load_kv) orders the copy before the
         H2D KV transfer on load_stream — same stream, so sequential.
         Using the transfer stream avoids fencing the compute stream.
+
+        Uses a cursor into the pre-allocated pinned buffer so that multiple
+        requests within the same wait_for_save / start_load_kv call each get a
+        non-overlapping slice, preventing a later CPU copy_ from stomping an
+        in-flight DMA from a previous iteration.  Caller must reset
+        self._slot_mapping_buf_cursor = 0 at the top of each call.
         """
         if slot_mapping.device.type == self.device.type:
             return slot_mapping
         _t0 = time.perf_counter()
         flat = slot_mapping.reshape(-1)
         n = flat.numel()
-        if self._slot_mapping_pinned_buf.numel() < n:
-            self._slot_mapping_pinned_buf = torch.empty(n, dtype=slot_mapping.dtype, pin_memory=True)
-            logger.warning("[slot_mapping_to_device] grew pinned buf to %d", n)
-        host_view = self._slot_mapping_pinned_buf[:n]
+        need = self._slot_mapping_buf_cursor + n
+        if self._slot_mapping_pinned_buf.numel() < need:
+            new_size = max(need, self._slot_mapping_pinned_buf.numel() * 2)
+            self._slot_mapping_pinned_buf = torch.empty(
+                new_size, dtype=torch.long, pin_memory=True
+            )
+            self._slot_mapping_buf_cursor = 0
+            logger.warning("[slot_mapping_to_device] grew pinned buf to %d", new_size)
+        host_view = self._slot_mapping_pinned_buf[
+            self._slot_mapping_buf_cursor : self._slot_mapping_buf_cursor + n
+        ]
+        self._slot_mapping_buf_cursor += n
         host_view.copy_(flat)  # pageable → pinned (CPU-only, no HIP)
         stream = self._get_connector_stream(kind)
         with torch.cuda.stream(stream):
@@ -1158,6 +1174,7 @@ class LMCacheConnectorV1Impl:
         assert self.lmcache_engine is not None
 
         _wfs_t0 = time.perf_counter()
+        self._slot_mapping_buf_cursor = 0
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
@@ -1174,7 +1191,6 @@ class LMCacheConnectorV1Impl:
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
 
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
             slot_mapping = self._slot_mapping_to_device(slot_mapping, kind="store")
 
             skip_leading_tokens = save_spec.skip_leading_tokens
