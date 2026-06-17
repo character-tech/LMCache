@@ -570,7 +570,9 @@ class LMCacheConnectorV1Impl:
         # Cursor-sliced so concurrent requests within one call get non-overlapping
         # regions; reset at the top of each wait_for_save / start_load_kv call.
         _prealloc_n = vllm_config.scheduler_config.max_num_batched_tokens
-        self._slot_mapping_pinned_buf = torch.empty(_prealloc_n, dtype=torch.long, pin_memory=True)
+        self._slot_mapping_pinned_buf = torch.empty(
+            _prealloc_n, dtype=torch.long, pin_memory=True
+        )
         self._slot_mapping_buf_cursor: int = 0
 
     def _check_legacy_register_kv_caches(self) -> None:
