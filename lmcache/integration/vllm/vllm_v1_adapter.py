@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time  # v15
 
 # Third Party
 from vllm.config import (
@@ -565,6 +566,11 @@ class LMCacheConnectorV1Impl:
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
 
+        # v15: pre-allocate pinned bounce buffer for slot_mapping H2D copies
+        _prealloc_n = 32768  # covers max tokens per slot_mapping
+        self._slot_mapping_pinned_buf = torch.empty(_prealloc_n, dtype=torch.long, pin_memory=True)
+        self._slot_mapping_store_stream = None  # resolved on first call via _ensure_slot_mapping_stream
+
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
         if self.lmcache_engine is None:
@@ -794,7 +800,7 @@ class LMCacheConnectorV1Impl:
 
             tokens = request.token_ids
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.to(self.device)
+            slot_mapping = self._slot_mapping_to_device(request.slot_mapping)
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -1030,7 +1036,7 @@ class LMCacheConnectorV1Impl:
                 assert len(slot_mapping) == len(token_ids)
 
                 # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.to(self.device)
+                slot_mapping = self._slot_mapping_to_device(slot_mapping)
 
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
@@ -1076,6 +1082,41 @@ class LMCacheConnectorV1Impl:
 
             next(layerwise_storer)
 
+    def _ensure_slot_mapping_stream(self):
+        if self._slot_mapping_store_stream is not None:
+            return self._slot_mapping_store_stream
+        try:
+            connector = self.lmcache_engine.storage_backend.gpu_connector
+            self._slot_mapping_store_stream = connector.store_stream
+        except AttributeError:
+            self._slot_mapping_store_stream = torch.cuda.Stream()
+            logger.warning("[v15] could not find store_stream on gpu_connector, using dedicated stream")
+        return self._slot_mapping_store_stream
+
+    def _slot_mapping_to_device(self, slot_mapping):
+        """v15: enqueue slot_mapping H2D on store_stream (not compute stream).
+        store_stream already does wait_stream(current_stream) before every KV transfer,
+        so the copy is ordered before the transfer without fencing the compute stream.
+        Avoids the transitive store_stream.synchronize() pulling in the compute queue.
+        """
+        if slot_mapping.device.type == self.device.type:
+            return slot_mapping
+        _t0 = time.perf_counter()
+        flat = slot_mapping.reshape(-1)
+        n = flat.numel()
+        if self._slot_mapping_pinned_buf.numel() < n:
+            self._slot_mapping_pinned_buf = torch.empty(n, dtype=slot_mapping.dtype, pin_memory=True)
+            logger.warning("[v15][slot_mapping_to_device] grew pinned buf to %d", n)
+        host_view = self._slot_mapping_pinned_buf[:n]
+        host_view.copy_(flat)  # pageable → pinned (CPU-only, no HIP)
+        store_stream = self._ensure_slot_mapping_stream()
+        with torch.cuda.stream(store_stream):
+            dev_tensor = host_view.to(self.device, non_blocking=True)
+        elapsed_ms = (time.perf_counter() - _t0) * 1000
+        if elapsed_ms > 10:
+            logger.warning('[v15][slot_mapping_to_device] took %.1f ms', elapsed_ms)
+        return dev_tensor.reshape(slot_mapping.shape)
+
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
@@ -1111,6 +1152,7 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
+        _wfs_t0 = time.perf_counter()  # v15
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
@@ -1128,7 +1170,7 @@ class LMCacheConnectorV1Impl:
             assert len(slot_mapping) == len(token_ids)
 
             # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.to(self.device)
+            slot_mapping = self._slot_mapping_to_device(slot_mapping)
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -1190,6 +1232,10 @@ class LMCacheConnectorV1Impl:
                 save_spec.skip_leading_tokens = len(token_ids)
                 if request.disagg_spec:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
+
+        _wfs_ms = (time.perf_counter() - _wfs_t0) * 1000  # v15
+        if _wfs_ms > 500:
+            logger.warning("[v15][wait_for_save] total=%.1f ms", _wfs_ms)  # v15
 
     @_lmcache_nvtx_annotate
     def get_finished(

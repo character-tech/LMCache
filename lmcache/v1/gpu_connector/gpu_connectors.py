@@ -2,6 +2,7 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
+import time  # v15
 
 # Third Party
 import torch
@@ -395,17 +396,29 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
             # Force a synchronize if the target buffer is NOT CUDA device
             # NOTE: for better performance, we may not want to sync for every
             # memory object
+            _ss_t0 = time.perf_counter()  # v15
             self.store_stream.synchronize()
+            _ss_ms = (time.perf_counter() - _ss_t0) * 1000  # v15
+            if _ss_ms > 50:
+                logger.warning("[v15][store_sync/from_gpu] %.1f ms", _ss_ms)  # v15
 
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
+        _btg_t0 = time.perf_counter()  # v15
+        n_objs = len(memory_objs) if hasattr(memory_objs, '__len__') else '?'
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
-        self.load_stream.synchronize()
+        # v15: replace CPU-blocking synchronize() with device-side fence.
+        # The compute stream waits on-device for H2D KV copies to complete,
+        # while the CPU returns immediately (eliminates rank-0 CPU block).
+        torch.cuda.current_stream().wait_stream(self.load_stream)
+        _btg_ms = (time.perf_counter() - _btg_t0) * 1000  # v15
+        if _btg_ms > 20:
+            logger.warning("[v15][batched_to_gpu] enqueue took %.1f ms n_objs=%s", _btg_ms, n_objs)  # v15
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
