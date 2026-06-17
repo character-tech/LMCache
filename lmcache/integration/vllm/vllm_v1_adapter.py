@@ -1093,6 +1093,8 @@ class LMCacheConnectorV1Impl:
         fallback stream if the connector doesn't expose one. `kind` is
         'store' or 'load'."""
         try:
+            if self.lmcache_engine is None:
+                raise AttributeError("lmcache_engine is None")
             connector = self.lmcache_engine.gpu_connector
             return getattr(connector, f"{kind}_stream")
         except AttributeError:
