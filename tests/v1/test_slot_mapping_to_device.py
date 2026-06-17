@@ -2,8 +2,8 @@
 """Unit tests for LMCacheConnectorV1Impl._slot_mapping_to_device and
 _get_connector_stream, tested in isolation without vLLM or CUDA."""
 
-import types
 from unittest.mock import MagicMock, patch
+import types
 
 import pytest
 import torch
@@ -117,7 +117,7 @@ def test_cpu_input_buffer_grows():
 
     sm = _cuda_typed_sm([1, 2, 3, 4, 5])
 
-    _run_with_fake_cuda(stub, sm, kind="store")  # return value not needed here
+    _run_with_fake_cuda(stub, sm, kind="store")
 
     assert stub._slot_mapping_pinned_buf.numel() >= 5
     assert stub._slot_mapping_buf_cursor == 5
@@ -129,10 +129,10 @@ def test_cursor_advances_across_calls():
     stub.device = MagicMock()
     stub.device.type = "rocm"
 
-    _run_with_fake_cuda(stub, _cuda_typed_sm([1, 2, 3]), kind="store")  # return value not needed here
+    _run_with_fake_cuda(stub, _cuda_typed_sm([1, 2, 3]), kind="store")
     assert stub._slot_mapping_buf_cursor == 3
 
-    _run_with_fake_cuda(stub, _cuda_typed_sm([4, 5]), kind="store")  # return value not needed here
+    _run_with_fake_cuda(stub, _cuda_typed_sm([4, 5]), kind="store")
     assert stub._slot_mapping_buf_cursor == 5
 
 
@@ -145,7 +145,7 @@ def test_buffer_wraps_when_cursor_exhausts():
 
     sm = _cuda_typed_sm([1, 2, 3])  # needs 3 → triggers growth
 
-    _run_with_fake_cuda(stub, sm, kind="store")  # return value not needed here
+    _run_with_fake_cuda(stub, sm, kind="store")
 
     assert stub._slot_mapping_pinned_buf.numel() >= 3
     # After growth cursor resets to 0 then advances by 3.
