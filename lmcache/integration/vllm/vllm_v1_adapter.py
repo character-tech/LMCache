@@ -4,7 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
-import time  # v15
+import time
 
 # Third Party
 from vllm.config import (
@@ -568,7 +568,7 @@ class LMCacheConnectorV1Impl:
 
         # Pre-allocate pinned bounce buffer for slot_mapping H2D copies.
         # One buffer shared by store and load paths (they don't interleave).
-        _prealloc_n = 32768  # covers max tokens per slot_mapping
+        _prealloc_n = vllm_config.scheduler_config.max_num_batched_tokens
         self._slot_mapping_pinned_buf = torch.empty(_prealloc_n, dtype=torch.long, pin_memory=True)
 
     def _check_legacy_register_kv_caches(self) -> None:
@@ -1157,7 +1157,7 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
-        _wfs_t0 = time.perf_counter()  # v15
+        _wfs_t0 = time.perf_counter()
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
@@ -1238,9 +1238,9 @@ class LMCacheConnectorV1Impl:
                 if request.disagg_spec:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
 
-        _wfs_ms = (time.perf_counter() - _wfs_t0) * 1000  # v15
+        _wfs_ms = (time.perf_counter() - _wfs_t0) * 1000
         if _wfs_ms > 500:
-            logger.warning("[v15][wait_for_save] total=%.1f ms", _wfs_ms)  # v15
+            logger.warning("[v15][wait_for_save] total=%.1f ms", _wfs_ms)
 
     @_lmcache_nvtx_annotate
     def get_finished(

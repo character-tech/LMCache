@@ -2,7 +2,7 @@
 # Standard
 from typing import List, Optional, Tuple, Union
 import abc
-import time  # v15
+import time
 
 # Third Party
 import torch
@@ -397,24 +397,24 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_to_gpu(self, memory_objs, starts, ends, **kwargs):
-        _btg_t0 = time.perf_counter()  # v15
-        n_objs = len(memory_objs) if hasattr(memory_objs, '__len__') else '?'
+        _btg_t0 = time.perf_counter()
+        n_objs = len(memory_objs) if hasattr(memory_objs, "__len__") else "?"
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
-        # v15: replace CPU-blocking synchronize() with device-side fence.
+        # Replace CPU-blocking synchronize() with device-side fence.
         # The compute stream waits on-device for H2D KV copies to complete,
-        # while the CPU returns immediately (eliminates rank-0 CPU block).
+        # while the CPU returns immediately.
         torch.cuda.current_stream().wait_stream(self.load_stream)
-        _btg_ms = (time.perf_counter() - _btg_t0) * 1000  # v15
+        _btg_ms = (time.perf_counter() - _btg_t0) * 1000
         if _btg_ms > 20:
-            logger.warning("[v15][batched_to_gpu] enqueue took %.1f ms n_objs=%s", _btg_ms, n_objs)  # v15
+            logger.warning("[v15][batched_to_gpu] enqueue took %.1f ms n_objs=%s", _btg_ms, n_objs)
 
     # TODO(Jiayi): need to optimize to enable real batching
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
-        # v15: device-side fence instead of per-memobj CPU-blocking synchronize().
+        # Device-side fence instead of per-memobj CPU-blocking synchronize().
         # Ensures D2H completes before KV pages can be evicted, without stalling
         # the engine thread for each memory object individually.
         if memory_objs and not next(iter(memory_objs)).tensor.is_cuda:
@@ -610,7 +610,7 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
-        # v15: device-side fence instead of CPU-blocking synchronize()
+        # Device-side fence instead of CPU-blocking synchronize()
         torch.cuda.current_stream().wait_stream(self.load_stream)
 
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
