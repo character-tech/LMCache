@@ -392,16 +392,6 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
                 )
                 memory_obj.tensor.copy_(tmp_gpu_buffer, non_blocking=True)
 
-        if not memory_obj.tensor.is_cuda:
-            # Force a synchronize if the target buffer is NOT CUDA device
-            # NOTE: for better performance, we may not want to sync for every
-            # memory object
-            _ss_t0 = time.perf_counter()  # v15
-            self.store_stream.synchronize()
-            _ss_ms = (time.perf_counter() - _ss_t0) * 1000  # v15
-            if _ss_ms > 50:
-                logger.warning("[v15][store_sync/from_gpu] %.1f ms", _ss_ms)  # v15
-
         if self.use_mla:
             memory_obj.metadata.fmt = MemoryFormat.KV_MLA_FMT
 
@@ -424,6 +414,11 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
+        # v15: device-side fence instead of per-memobj CPU-blocking synchronize().
+        # Ensures D2H completes before KV pages can be evicted, without stalling
+        # the engine thread for each memory object individually.
+        if memory_objs and not next(iter(memory_objs)).tensor.is_cuda:
+            torch.cuda.current_stream().wait_stream(self.store_stream)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
@@ -615,7 +610,8 @@ class VLLMPagedMemGPUConnectorV3(GPUConnectorInterface):
         with torch.cuda.stream(self.load_stream):
             for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
                 self.to_gpu(memory_obj, start, end, **kwargs)
-        self.load_stream.synchronize()
+        # v15: device-side fence instead of CPU-blocking synchronize()
+        torch.cuda.current_stream().wait_stream(self.load_stream)
 
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
