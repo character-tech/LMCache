@@ -422,10 +422,9 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
         # Device-side fence instead of per-memobj CPU-blocking synchronize().
-        # Ensures D2H completes before KV pages can be evicted, without stalling
-        # the engine thread for each memory object individually.
-        first = next(iter(memory_objs), None)
-        if first is not None and first.tensor is not None and not first.tensor.is_cuda:
+        # Fence if ANY target is host memory so a heterogeneous batch can't
+        # silently skip the D2H wait and corrupt KV data.
+        if any(mo.tensor is not None and not mo.tensor.is_cuda for mo in memory_objs):
             torch.cuda.current_stream().wait_stream(self.store_stream)
 
     def get_shape(self, num_tokens: int) -> torch.Size:
