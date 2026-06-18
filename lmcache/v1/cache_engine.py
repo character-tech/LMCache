@@ -123,6 +123,12 @@ class LMCacheEngine:
                 else torch.cuda.Stream()
             )
 
+        # HBM pool bufs: eliminate per-chunk torch.empty() in broadcast hot path
+        self._send_pool_buf = None
+        self._send_pool_cursor: int = 0
+        self._recv_pool_buf = None
+        self._recv_pool_cursor: int = 0
+
         self.enable_controller = config.enable_controller
 
         # NOTE: Unix systems use fork by default
@@ -1796,6 +1802,9 @@ class LMCacheEngine:
             chunk_count = len(reordered_chunks)
             self.broadcast_object_fn(chunk_count, self.metadata.first_rank)
 
+            self._send_pool_cursor = 0
+            send_device = f"cuda:{self.metadata.worker_id}"
+
             # Broadcast each chunk's data
             for key, memory_obj, start, end in reordered_chunks:
                 # Combine (start, end) and metadata into single broadcast
@@ -1806,7 +1815,23 @@ class LMCacheEngine:
                 # Broadcast tensor data
                 raw_tensor = memory_obj.raw_tensor
                 assert raw_tensor is not None
-                tensor_to_broadcast = raw_tensor.to(f"cuda:{self.metadata.worker_id}")
+                # pool-sliced HBM dst; pinned src -> async PCIe DMA
+                chunk_size = int(raw_tensor.numel())
+                need = self._send_pool_cursor + chunk_size
+                if (
+                    self._send_pool_buf is None
+                    or self._send_pool_buf.numel() < need
+                    or self._send_pool_buf.device != torch.device(send_device)
+                ):
+                    new_size = int(1.5 * need)
+                    self._send_pool_buf = torch.empty(
+                        new_size, dtype=torch.uint8, device=send_device
+                    )
+                tensor_to_broadcast = self._send_pool_buf[
+                    self._send_pool_cursor : self._send_pool_cursor + chunk_size
+                ]
+                self._send_pool_cursor += chunk_size
+                tensor_to_broadcast.copy_(raw_tensor, non_blocking=True)
                 self.broadcast_fn(tensor_to_broadcast, self.metadata.first_rank)
         else:
             # Receive total chunk count
@@ -1816,6 +1841,10 @@ class LMCacheEngine:
                     f"rank={self.metadata.worker_id} received None chunk_count"
                 )
                 return
+
+            self._recv_pool_cursor = 0
+            local_rank = self.metadata.worker_id % torch.cuda.device_count()
+            recv_device = f"cuda:{local_rank}"
 
             # Fill reordered_chunks with received data
             for _ in range(chunk_count):
@@ -1834,12 +1863,22 @@ class LMCacheEngine:
 
                 # Create tensor and receive data
                 metadata = MemoryObjMetadata.from_dict(metadata_dict)
-                local_rank = self.metadata.worker_id % torch.cuda.device_count()
-                raw_tensor = torch.empty(
-                    torch.Size([metadata.get_size()]),
-                    dtype=torch.uint8,
-                    device=f"cuda:{local_rank}",
-                )
+                # pool-sliced HBM dst; avoids per-chunk torch.empty()
+                chunk_size = int(metadata.get_size())
+                need = self._recv_pool_cursor + chunk_size
+                if (
+                    self._recv_pool_buf is None
+                    or self._recv_pool_buf.numel() < need
+                    or self._recv_pool_buf.device != torch.device(recv_device)
+                ):
+                    new_size = int(1.5 * need)
+                    self._recv_pool_buf = torch.empty(
+                        new_size, dtype=torch.uint8, device=recv_device
+                    )
+                raw_tensor = self._recv_pool_buf[
+                    self._recv_pool_cursor : self._recv_pool_cursor + chunk_size
+                ]
+                self._recv_pool_cursor += chunk_size
                 self.broadcast_fn(raw_tensor, self.metadata.first_rank)
 
                 # Create temporary memory object (key not needed for other ranks)

@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Generator, Optional, Union
 import os
+import time
 
 # Third Party
 from vllm.config import (
@@ -565,6 +566,15 @@ class LMCacheConnectorV1Impl:
         self._requests_priority: dict[str, int] = {}
         self._invalid_block_ids: set[int] = set()
 
+        # Pre-allocate pinned bounce buffer for slot_mapping H2D copies.
+        # Cursor-sliced so concurrent requests within one call get non-overlapping
+        # regions; reset at the top of each wait_for_save / start_load_kv call.
+        _prealloc_n = vllm_config.scheduler_config.max_num_batched_tokens
+        self._slot_mapping_pinned_buf = torch.empty(
+            _prealloc_n, dtype=torch.long, pin_memory=True
+        )
+        self._slot_mapping_buf_cursor: int = 0
+
     def _check_legacy_register_kv_caches(self) -> None:
         """Check for legacy connector without register_kv_caches implementation."""
         if self.lmcache_engine is None:
@@ -779,6 +789,7 @@ class LMCacheConnectorV1Impl:
                 continue
             last_idx = idx
 
+        self._slot_mapping_buf_cursor = 0
         for idx, request in enumerate(metadata.requests):
             # Update metrics for all requests that have a load_spec
             if request.load_spec is not None:
@@ -793,8 +804,9 @@ class LMCacheConnectorV1Impl:
                 continue
 
             tokens = request.token_ids
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = request.slot_mapping.to(self.device)
+            slot_mapping = self._slot_mapping_to_device(
+                request.slot_mapping, kind="load"
+            )
             assert len(tokens) == len(slot_mapping)
 
             token_mask = torch.ones(len(tokens), dtype=torch.bool)
@@ -1012,6 +1024,7 @@ class LMCacheConnectorV1Impl:
 
         kvcaches = list(self.kv_caches.values())
         is_first = True
+        self._slot_mapping_buf_cursor = 0
 
         for request in connector_metadata.requests:
             save_spec = request.save_spec
@@ -1029,8 +1042,7 @@ class LMCacheConnectorV1Impl:
                 assert isinstance(slot_mapping, torch.Tensor)
                 assert len(slot_mapping) == len(token_ids)
 
-                # TODO: have a pre-allocated buffer to hold the slot_mappings
-                slot_mapping = slot_mapping.to(self.device)
+                slot_mapping = self._slot_mapping_to_device(slot_mapping, kind="store")
 
                 if self.kv_role == "kv_producer":
                     skip_leading_tokens = 0
@@ -1076,6 +1088,68 @@ class LMCacheConnectorV1Impl:
 
             next(layerwise_storer)
 
+    def _get_connector_stream(self, kind: str) -> torch.cuda.Stream:
+        """Return store_stream or load_stream from the gpu_connector, or a
+        fallback stream if the connector doesn't expose one. `kind` is
+        'store' or 'load'."""
+        try:
+            if self.lmcache_engine is None:
+                raise AttributeError("lmcache_engine is None")
+            connector = self.lmcache_engine.gpu_connector
+            return getattr(connector, f"{kind}_stream")
+        except AttributeError:
+            logger.warning(
+                "gpu_connector has no %s_stream, using current stream for slot_mapping",
+                kind,
+            )
+            return torch.cuda.current_stream()
+
+    def _slot_mapping_to_device(self, slot_mapping, kind: str = "store"):
+        """Enqueue slot_mapping H2D on the connector's store_stream or load_stream.
+
+        Passing `kind='store'` (default, used by wait_for_save) orders the copy
+        before the D2H KV transfer on store_stream — same stream, so sequential.
+        Passing `kind='load'` (used by start_load_kv) orders the copy before the
+        H2D KV transfer on load_stream — same stream, so sequential.
+        Using the transfer stream avoids fencing the compute stream.
+
+        Uses a cursor into the pre-allocated pinned buffer so that multiple
+        requests within the same wait_for_save / start_load_kv call each get a
+        non-overlapping slice, preventing a later CPU copy_ from stomping an
+        in-flight DMA from a previous iteration.  Caller must reset
+        self._slot_mapping_buf_cursor = 0 at the top of each call.
+        """
+        if slot_mapping.device.type == self.device.type:
+            return slot_mapping
+        _t0 = time.perf_counter()
+        flat = slot_mapping.reshape(-1)
+        n = flat.numel()
+        need = self._slot_mapping_buf_cursor + n
+        if self._slot_mapping_pinned_buf.numel() < need:
+            new_size = max(need, self._slot_mapping_pinned_buf.numel() * 2)
+            # The old buffer is kept alive by any dev_tensor returned from a
+            # previous iteration in this call (via .to(non_blocking=True) which
+            # holds a reference to its pinned source). Replacing the attribute
+            # here is safe — the old tensor will not be freed until those GPU
+            # copies complete and the returned tensors go out of scope.
+            self._slot_mapping_pinned_buf = torch.empty(
+                new_size, dtype=torch.long, pin_memory=True
+            )
+            self._slot_mapping_buf_cursor = 0
+            logger.warning("[slot_mapping_to_device] grew pinned buf to %d", new_size)
+        host_view = self._slot_mapping_pinned_buf[
+            self._slot_mapping_buf_cursor : self._slot_mapping_buf_cursor + n
+        ]
+        self._slot_mapping_buf_cursor += n
+        host_view.copy_(flat)  # pageable → pinned (CPU-only, no HIP)
+        stream = self._get_connector_stream(kind)
+        with torch.cuda.stream(stream):
+            dev_tensor = host_view.to(self.device, non_blocking=True)
+        elapsed_ms = (time.perf_counter() - _t0) * 1000
+        if elapsed_ms > 10:
+            logger.warning("[slot_mapping_to_device] took %.1f ms", elapsed_ms)
+        return dev_tensor.reshape(slot_mapping.shape)
+
     @_lmcache_nvtx_annotate
     def wait_for_save(self):
         """Blocking until the KV cache is saved to the connector buffer."""
@@ -1111,6 +1185,8 @@ class LMCacheConnectorV1Impl:
 
         assert self.lmcache_engine is not None
 
+        _wfs_t0 = time.perf_counter()
+        self._slot_mapping_buf_cursor = 0
         for request in connector_metadata.requests:
             # unpin the kv caches according to req_id
             self.lmcache_engine.lookup_unpin(request.req_id)
@@ -1127,8 +1203,7 @@ class LMCacheConnectorV1Impl:
             assert isinstance(slot_mapping, torch.Tensor)
             assert len(slot_mapping) == len(token_ids)
 
-            # TODO: have a pre-allocated buffer to hold the slot_mappings
-            slot_mapping = slot_mapping.to(self.device)
+            slot_mapping = self._slot_mapping_to_device(slot_mapping, kind="store")
 
             skip_leading_tokens = save_spec.skip_leading_tokens
             # shared storage disaggregation will not have a disagg_spec passed in
@@ -1190,6 +1265,10 @@ class LMCacheConnectorV1Impl:
                 save_spec.skip_leading_tokens = len(token_ids)
                 if request.disagg_spec:
                     request.disagg_spec.num_transferred_tokens = len(token_ids)
+
+        _wfs_ms = (time.perf_counter() - _wfs_t0) * 1000
+        if _wfs_ms > 500:
+            logger.warning("[wait_for_save] total=%.1f ms", _wfs_ms)
 
     @_lmcache_nvtx_annotate
     def get_finished(
