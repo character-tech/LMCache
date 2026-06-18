@@ -101,10 +101,10 @@ def _make_work_item(req_id: str = "req-1", d2h_event=None):
 class FakeEngine:
     """Minimal stand-in for LMCacheEngine that only exercises the background thread."""
 
-    def __init__(self, storage_manager=None, stats_monitor=None):
+    def __init__(self, storage_manager=None, stats_monitor=None, maxsize=0):
         self.storage_manager = storage_manager or MagicMock()
         self.stats_monitor = stats_monitor or MagicMock()
-        self._store_queue: queue.Queue = queue.Queue()
+        self._store_queue: queue.Queue = queue.Queue(maxsize=maxsize)
         self._store_thread = threading.Thread(
             target=self._background_store_worker,
             name="lmcache-bg-store-test",
@@ -149,6 +149,20 @@ class FakeEngine:
                 pass  # intentionally suppressed; tests assert via call counts
             finally:
                 self._store_queue.task_done()
+
+    def store(self, item) -> bool:
+        """Mirrors LMCacheEngine.store() put_nowait + ref_count_down on full.
+
+        Returns True if enqueued, False if dropped.
+        """
+        try:
+            self._store_queue.put_nowait(item)
+            return True
+        except queue.Full:
+            _, memory_objs, *_ = item
+            for mo in memory_objs:
+                mo.ref_count_down()
+            return False
 
     def _drain_store_queue(self) -> None:
         """Block until all pending background store work completes."""
@@ -324,33 +338,30 @@ def test_none_d2h_event_skips_synchronize():
 
 
 def test_store_queue_full_drops_and_calls_ref_count_down():
-    """Queue full: put_nowait drops the item and ref_count_down is called."""
+    """Queue full: store() drops the item and calls ref_count_down on memory_objs."""
     barrier = threading.Event()
-    engine = FakeEngine()
-    # Shrink to maxsize=1 so it fills immediately
-    engine._store_queue = queue.Queue(maxsize=1)
+    # maxsize=1: one slot fills immediately, second store must be dropped
+    engine = FakeEngine(maxsize=1)
 
-    # First item blocks the worker indefinitely, filling the queue
+    # Block the worker so the queue stays full
     engine.storage_manager.batched_put.side_effect = lambda *a, **kw: barrier.wait(
         timeout=10
     )
-    engine._store_queue.put(_make_work_item("req-fill"))
+    # Fill the single slot
+    engine.store(_make_work_item("req-fill"))
 
-    # Now try to enqueue via put_nowait — should raise queue.Full
-    memory_objs = [MagicMock()]
-    dropped = False
-    try:
-        engine._store_queue.put_nowait(_make_work_item("req-drop"))
-    except queue.Full:
-        dropped = True
-        for mo in memory_objs:
-            mo.ref_count_down()
+    # Second store should be dropped; ref_count_down must be called on its memory_objs
+    drop_item = _make_work_item("req-drop")
+    _, memory_objs, *_ = drop_item
+    dropped = not engine.store(drop_item)
 
-    assert dropped, "put_nowait should have raised queue.Full"
+    assert dropped, "store() should return False when queue is full"
     for mo in memory_objs:
         mo.ref_count_down.assert_called_once()
 
-    # Unblock and clean up
+    # Worker must still be alive for the next valid item
+    assert engine._store_thread.is_alive()
+
     barrier.set()
     engine.shutdown()
 
