@@ -76,7 +76,7 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         starts: List[int],
         ends: List[int],
         **kwargs,
-    ):
+    ) -> Optional[torch.cuda.Event]:
         """
         Batched load the data from a GPU memory into the memory objects.
         Sub-classes should define the format of the kwargs.
@@ -87,6 +87,9 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
             token sequence.
         :param List[int] ends: The ending indices of the data in the corresponding
             token sequence.
+        :return: A CUDA Event recorded on store_stream after all D2H copies if the
+            caller must CPU-synchronize before reading the pinned buffer (async path),
+            or None if the implementation synchronizes internally.
         """
         raise NotImplementedError
 
