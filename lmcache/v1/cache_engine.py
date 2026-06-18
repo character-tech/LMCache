@@ -1814,109 +1814,107 @@ class LMCacheEngine:
         ret_mask,
     ):
         """
-        Handles broadcasting or receiving memory objects in a distributed environment.
+        Broadcast retrieved memory objects from first rank to all other TP ranks.
 
-        This function implements the communication logic where:
-        - The first rank (coordinator) broadcasts memory objects and metadata to others
-        - Other ranks receive and reconstruct the memory objects
+        Batched protocol: 2 collectives total per retrieve (regardless of chunk count C)
+          1. broadcast_object_fn: list of (start, end, metadata_dict) for all C chunks
+          2. broadcast_fn: single contiguous tensor containing all C chunk tensors
+
+        This replaces the previous per-chunk loop of (1 + 2C) collectives, which caused
+        the shm-ring rendezvous to stall all 8 ranks once per chunk under burst load.
 
         Parameters:
-        reordered_chunks: List of tuples containing [key, memory object, start, end]
-        ret_mask: Boolean mask indicating which positions have been processed
-
-        Side Effects:
-        - On first rank:
-          * Broadcasts chunk count and each chunk's combined metadata
-          * Broadcasts tensor data
-        - On other ranks:
-          * Receives chunk data and populates reordered_chunks
-          * Updates ret_mask to mark received positions as True
+        reordered_chunks: List of tuples [key, memory_obj, start, end] (first rank);
+                          empty list that gets populated (other ranks)
+        ret_mask: Boolean mask; updated in-place on receiving ranks
         """
         if self.metadata.is_first_rank():
-            # Broadcast total chunk count
-            chunk_count = len(reordered_chunks)
-            self.broadcast_object_fn(chunk_count, self.metadata.first_rank)
-
-            self._send_pool_cursor = 0
             send_device = f"cuda:{self.metadata.worker_id}"
 
-            # Broadcast each chunk's data
+            # --- Pass 1: build batched metadata and contiguous send buffer ---
+            all_metadata = []
+            total_numel = 0
             for key, memory_obj, start, end in reordered_chunks:
-                # Combine (start, end) and metadata into single broadcast
-                metadata_dict = memory_obj.metadata.to_dict()
-                combined_metadata = (start, end, metadata_dict)
-                self.broadcast_object_fn(combined_metadata, self.metadata.first_rank)
-
-                # Broadcast tensor data
                 raw_tensor = memory_obj.raw_tensor
                 assert raw_tensor is not None
-                # pool-sliced HBM dst; pinned src -> async PCIe DMA
+                all_metadata.append((start, end, memory_obj.metadata.to_dict()))
+                total_numel += int(raw_tensor.numel())
+
+            # Grow send pool buffer once for the whole batch
+            if (
+                self._send_pool_buf is None
+                or self._send_pool_buf.numel() < total_numel
+                or self._send_pool_buf.device != torch.device(send_device)
+            ):
+                new_size = int(1.5 * total_numel) if total_numel > 0 else 1
+                self._send_pool_buf = torch.empty(
+                    new_size, dtype=torch.uint8, device=send_device
+                )
+
+            # --- Collective 1: all metadata in one object broadcast ---
+            self.broadcast_object_fn(all_metadata, self.metadata.first_rank)
+
+            # --- Pass 2: copy all chunks into contiguous buffer ---
+            self._send_pool_cursor = 0
+            for key, memory_obj, start, end in reordered_chunks:
+                raw_tensor = memory_obj.raw_tensor
                 chunk_size = int(raw_tensor.numel())
-                need = self._send_pool_cursor + chunk_size
-                if (
-                    self._send_pool_buf is None
-                    or self._send_pool_buf.numel() < need
-                    or self._send_pool_buf.device != torch.device(send_device)
-                ):
-                    new_size = int(1.5 * need)
-                    self._send_pool_buf = torch.empty(
-                        new_size, dtype=torch.uint8, device=send_device
-                    )
-                tensor_to_broadcast = self._send_pool_buf[
+                dst = self._send_pool_buf[
                     self._send_pool_cursor : self._send_pool_cursor + chunk_size
                 ]
+                dst.copy_(raw_tensor, non_blocking=True)
                 self._send_pool_cursor += chunk_size
-                tensor_to_broadcast.copy_(raw_tensor, non_blocking=True)
-                self.broadcast_fn(tensor_to_broadcast, self.metadata.first_rank)
-        else:
-            # Receive total chunk count
-            chunk_count = self.broadcast_object_fn(None, self.metadata.first_rank)
-            if chunk_count is None:
-                logger.warning(
-                    f"rank={self.metadata.worker_id} received None chunk_count"
-                )
-                return
 
-            self._recv_pool_cursor = 0
+            # --- Collective 2: single tensor broadcast for all chunks ---
+            if total_numel > 0:
+                self.broadcast_fn(
+                    self._send_pool_buf[:total_numel], self.metadata.first_rank
+                )
+        else:
             local_rank = self.metadata.worker_id % torch.cuda.device_count()
             recv_device = f"cuda:{local_rank}"
 
-            # Fill reordered_chunks with received data
-            for _ in range(chunk_count):
-                # Receive combined metadata (start, end, metadata_dict)
-                combined_metadata = self.broadcast_object_fn(
-                    None, self.metadata.first_rank
+            # --- Collective 1: receive batched metadata ---
+            all_metadata = self.broadcast_object_fn(None, self.metadata.first_rank)
+            if all_metadata is None:
+                logger.warning(
+                    f"rank={self.metadata.worker_id} received None all_metadata"
                 )
-                if combined_metadata is None:
-                    logger.warning(
-                        f"rank={self.metadata.worker_id} "
-                        "received None combined_metadata"
-                    )
-                    break
-                start, end, metadata_dict = combined_metadata
-                ret_mask[start:end] = True
+                return
 
-                # Create tensor and receive data
+            # Compute total receive buffer size from metadata
+            total_numel = sum(
+                int(MemoryObjMetadata.from_dict(md).get_size())
+                for _, _, md in all_metadata
+            )
+
+            # Grow recv pool buffer once for the whole batch
+            if (
+                self._recv_pool_buf is None
+                or self._recv_pool_buf.numel() < total_numel
+                or self._recv_pool_buf.device != torch.device(recv_device)
+            ):
+                new_size = int(1.5 * total_numel) if total_numel > 0 else 1
+                self._recv_pool_buf = torch.empty(
+                    new_size, dtype=torch.uint8, device=recv_device
+                )
+
+            # --- Collective 2: receive single contiguous tensor ---
+            if total_numel > 0:
+                self.broadcast_fn(
+                    self._recv_pool_buf[:total_numel], self.metadata.first_rank
+                )
+
+            # --- Slice buffer into per-chunk MemoryObjs ---
+            self._recv_pool_cursor = 0
+            for start, end, metadata_dict in all_metadata:
+                ret_mask[start:end] = True
                 metadata = MemoryObjMetadata.from_dict(metadata_dict)
-                # pool-sliced HBM dst; avoids per-chunk torch.empty()
                 chunk_size = int(metadata.get_size())
-                need = self._recv_pool_cursor + chunk_size
-                if (
-                    self._recv_pool_buf is None
-                    or self._recv_pool_buf.numel() < need
-                    or self._recv_pool_buf.device != torch.device(recv_device)
-                ):
-                    new_size = int(1.5 * need)
-                    self._recv_pool_buf = torch.empty(
-                        new_size, dtype=torch.uint8, device=recv_device
-                    )
                 raw_tensor = self._recv_pool_buf[
                     self._recv_pool_cursor : self._recv_pool_cursor + chunk_size
                 ]
                 self._recv_pool_cursor += chunk_size
-                self.broadcast_fn(raw_tensor, self.metadata.first_rank)
-
-                # Create temporary memory object (key not needed for other ranks)
                 memory_obj = TensorMemoryObj(
                     raw_data=raw_tensor, metadata=metadata, parent_allocator=None
                 )
