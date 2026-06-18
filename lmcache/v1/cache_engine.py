@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import queue
+import threading
 import time
 
 # Third Party
@@ -230,6 +232,104 @@ class LMCacheEngine:
 
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
+
+        # Background thread: offloads CPU batched_put from engine thread
+        # after D2H fence.
+        self._store_queue: queue.Queue = queue.Queue(maxsize=64)
+        self._store_consecutive_failures: int = 0
+        # Mirror DEFAULT_GET_BLOCKING_FAILED_THRESHOLD from health_monitor.
+        self._store_failure_threshold: int = 10
+        self._store_thread = threading.Thread(
+            target=self._background_store_worker,
+            name="lmcache-bg-store",
+            daemon=True,
+        )
+        self._store_thread.start()
+
+    def _background_store_worker(self) -> None:
+        """Daemon thread that executes batched_put work items."""
+        while True:
+            item = self._store_queue.get()
+            if item is None:
+                break
+            req_id = "<unknown>"
+            try:
+                (
+                    keys,
+                    memory_objs,
+                    transfer_spec,
+                    store_location,
+                    store_stats,
+                    tot_token_num,
+                    num_to_store_tokens,
+                    tot_kv_size,
+                    req_id,
+                    d2h_event,
+                ) = item
+                # CPU-block on this background thread (not the engine thread)
+                # until the D2H DMA on store_stream has fully landed in the
+                # pinned CPU buffer before batched_put reads it.
+                if d2h_event is not None:
+                    d2h_event.synchronize()
+                with store_stats.profile_put():
+                    assert self.storage_manager is not None
+                    self.storage_manager.batched_put(
+                        keys,
+                        memory_objs,
+                        transfer_spec=transfer_spec,
+                        location=store_location,
+                    )
+
+                if store_stats.put_time > 0.5:
+                    logger.warning(
+                        "[req_id=%s] Background batched_put took %.1f ms "
+                        "(threshold 500 ms)",
+                        req_id,
+                        store_stats.put_time * 1000,
+                    )
+
+                self.stats_monitor.on_store_finished(
+                    store_stats,
+                    tot_token_num,
+                )
+                tot_time = store_stats.time_to_store()
+
+                logger.info(
+                    "[req_id=%s] Stored %d out of total %d tokens. "
+                    "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
+                    "offload_time: %.4f ms, put_time: %.4f ms",
+                    req_id,
+                    tot_token_num,
+                    num_to_store_tokens,
+                    tot_kv_size / 1024**3,
+                    tot_time * 1000,
+                    tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                    (store_stats.process_tokens_time + store_stats.from_gpu_time)
+                    * 1000,
+                    store_stats.put_time * 1000,
+                )
+                self._store_consecutive_failures = 0
+            except Exception:
+                logger.exception(
+                    "Error in background store worker for req_id=%s", req_id
+                )
+                self._store_consecutive_failures += 1
+                if (
+                    self._store_consecutive_failures >= self._store_failure_threshold
+                    and self._health_monitor is not None
+                ):
+                    logger.error(
+                        "Background store failed %d consecutive times; "
+                        "signaling health monitor to degrade.",
+                        self._store_consecutive_failures,
+                    )
+                    self._health_monitor._set_healthy(False)
+            finally:
+                self._store_queue.task_done()
+
+    def _drain_store_queue(self) -> None:
+        """Block until all pending background store work completes."""
+        self._store_queue.join()
 
     def set_health_monitor(self, health_monitor: "HealthMonitor") -> None:
         """
@@ -536,38 +636,45 @@ class LMCacheEngine:
             return
 
         with store_stats.profile_from_gpu():
-            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
-
-        with store_stats.profile_put():
-            transfer_spec = kwargs.get("transfer_spec", None)
-            # TODO: we implicitly rely on batched_put to call ref_count_down
-            # this management should be done in a cleaner way
-            self.storage_manager.batched_put(
-                keys,
-                memory_objs,
-                transfer_spec=transfer_spec,
-                location=self.store_location,
+            d2h_event = self.gpu_connector.batched_from_gpu(
+                memory_objs, starts, ends, **kwargs
             )
 
-        self.stats_monitor.on_store_finished(
+        # Hand off the CPU-only batched_put work to the background store
+        # thread so the engine thread can return immediately and serve the
+        # next retrieve without blocking.  Memory objects remain alive
+        # (ref_count >= 1 from allocation) until batched_put calls
+        # ref_count_down in the background thread.
+        # d2h_event is a CUDA Event recorded on store_stream after all D2H
+        # copies; the background thread synchronizes on it before reading the
+        # pinned CPU buffers.
+        transfer_spec = kwargs.get("transfer_spec", None)
+        item = (
+            keys,
+            memory_objs,
+            transfer_spec,
+            self.store_location,
             store_stats,
             tot_token_num,
-        )
-        tot_time = store_stats.time_to_store()
-
-        logger.info(
-            "[req_id=%s] Stored %d out of total %d tokens. "
-            "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
-            "offload_time: %.4f ms, put_time: %.4f ms",
-            req_id,
-            tot_token_num,
             num_to_store_tokens,
-            tot_kv_size / 1024**3,
-            tot_time * 1000,
-            tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-            (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
-            store_stats.put_time * 1000,
+            tot_kv_size,
+            req_id,
+            d2h_event,
         )
+        try:
+            self._store_queue.put_nowait(item)
+        except queue.Full:
+            # Background thread is backed up; drop this store rather than
+            # blocking the engine thread.  The prefix will be recomputed on
+            # next access — no correctness issue, just a cache miss.
+            logger.warning(
+                "[req_id=%s] Store queue full (maxsize=%d), dropping store "
+                "to avoid blocking engine thread.",
+                req_id,
+                self._store_queue.maxsize,
+            )
+            for mo in memory_objs:
+                mo.ref_count_down()
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1528,6 +1635,18 @@ class LMCacheEngine:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
 
+        # Drain pending background stores before tearing down backends
+        try:
+            logger.info("Draining background store queue...")
+            self._drain_store_queue()
+            self._store_queue.put(None)  # shutdown sentinel
+            self._store_thread.join(timeout=10)
+            if self._store_thread.is_alive():
+                logger.warning("Background store thread did not exit within timeout")
+            logger.info("Background store thread stopped")
+        except Exception as e:
+            logger.error("Error stopping background store thread: %s", e)
+
         if self.lmcache_worker is not None:
             try:
                 logger.info("Closing lmcache_worker...")
@@ -1695,109 +1814,107 @@ class LMCacheEngine:
         ret_mask,
     ):
         """
-        Handles broadcasting or receiving memory objects in a distributed environment.
+        Broadcast retrieved memory objects from first rank to all other TP ranks.
 
-        This function implements the communication logic where:
-        - The first rank (coordinator) broadcasts memory objects and metadata to others
-        - Other ranks receive and reconstruct the memory objects
+        Batched protocol: 2 collectives total per retrieve (regardless of chunk count C)
+          1. broadcast_object_fn: list of (start, end, metadata_dict) for all C chunks
+          2. broadcast_fn: single contiguous tensor containing all C chunk tensors
+
+        This replaces the previous per-chunk loop of (1 + 2C) collectives, which caused
+        the shm-ring rendezvous to stall all 8 ranks once per chunk under burst load.
 
         Parameters:
-        reordered_chunks: List of tuples containing [key, memory object, start, end]
-        ret_mask: Boolean mask indicating which positions have been processed
-
-        Side Effects:
-        - On first rank:
-          * Broadcasts chunk count and each chunk's combined metadata
-          * Broadcasts tensor data
-        - On other ranks:
-          * Receives chunk data and populates reordered_chunks
-          * Updates ret_mask to mark received positions as True
+        reordered_chunks: List of tuples [key, memory_obj, start, end] (first rank);
+                          empty list that gets populated (other ranks)
+        ret_mask: Boolean mask; updated in-place on receiving ranks
         """
         if self.metadata.is_first_rank():
-            # Broadcast total chunk count
-            chunk_count = len(reordered_chunks)
-            self.broadcast_object_fn(chunk_count, self.metadata.first_rank)
-
-            self._send_pool_cursor = 0
             send_device = f"cuda:{self.metadata.worker_id}"
 
-            # Broadcast each chunk's data
+            # --- Pass 1: build batched metadata and contiguous send buffer ---
+            all_metadata = []
+            total_numel = 0
             for key, memory_obj, start, end in reordered_chunks:
-                # Combine (start, end) and metadata into single broadcast
-                metadata_dict = memory_obj.metadata.to_dict()
-                combined_metadata = (start, end, metadata_dict)
-                self.broadcast_object_fn(combined_metadata, self.metadata.first_rank)
-
-                # Broadcast tensor data
                 raw_tensor = memory_obj.raw_tensor
                 assert raw_tensor is not None
-                # pool-sliced HBM dst; pinned src -> async PCIe DMA
+                all_metadata.append((start, end, memory_obj.metadata.to_dict()))
+                total_numel += int(raw_tensor.numel())
+
+            # Grow send pool buffer once for the whole batch
+            if (
+                self._send_pool_buf is None
+                or self._send_pool_buf.numel() < total_numel
+                or self._send_pool_buf.device != torch.device(send_device)
+            ):
+                new_size = int(1.5 * total_numel) if total_numel > 0 else 1
+                self._send_pool_buf = torch.empty(
+                    new_size, dtype=torch.uint8, device=send_device
+                )
+
+            # --- Collective 1: all metadata in one object broadcast ---
+            self.broadcast_object_fn(all_metadata, self.metadata.first_rank)
+
+            # --- Pass 2: copy all chunks into contiguous buffer ---
+            self._send_pool_cursor = 0
+            for key, memory_obj, start, end in reordered_chunks:
+                raw_tensor = memory_obj.raw_tensor
                 chunk_size = int(raw_tensor.numel())
-                need = self._send_pool_cursor + chunk_size
-                if (
-                    self._send_pool_buf is None
-                    or self._send_pool_buf.numel() < need
-                    or self._send_pool_buf.device != torch.device(send_device)
-                ):
-                    new_size = int(1.5 * need)
-                    self._send_pool_buf = torch.empty(
-                        new_size, dtype=torch.uint8, device=send_device
-                    )
-                tensor_to_broadcast = self._send_pool_buf[
+                dst = self._send_pool_buf[
                     self._send_pool_cursor : self._send_pool_cursor + chunk_size
                 ]
+                dst.copy_(raw_tensor, non_blocking=True)
                 self._send_pool_cursor += chunk_size
-                tensor_to_broadcast.copy_(raw_tensor, non_blocking=True)
-                self.broadcast_fn(tensor_to_broadcast, self.metadata.first_rank)
-        else:
-            # Receive total chunk count
-            chunk_count = self.broadcast_object_fn(None, self.metadata.first_rank)
-            if chunk_count is None:
-                logger.warning(
-                    f"rank={self.metadata.worker_id} received None chunk_count"
-                )
-                return
 
-            self._recv_pool_cursor = 0
+            # --- Collective 2: single tensor broadcast for all chunks ---
+            if total_numel > 0:
+                self.broadcast_fn(
+                    self._send_pool_buf[:total_numel], self.metadata.first_rank
+                )
+        else:
             local_rank = self.metadata.worker_id % torch.cuda.device_count()
             recv_device = f"cuda:{local_rank}"
 
-            # Fill reordered_chunks with received data
-            for _ in range(chunk_count):
-                # Receive combined metadata (start, end, metadata_dict)
-                combined_metadata = self.broadcast_object_fn(
-                    None, self.metadata.first_rank
+            # --- Collective 1: receive batched metadata ---
+            all_metadata = self.broadcast_object_fn(None, self.metadata.first_rank)
+            if all_metadata is None:
+                logger.warning(
+                    f"rank={self.metadata.worker_id} received None all_metadata"
                 )
-                if combined_metadata is None:
-                    logger.warning(
-                        f"rank={self.metadata.worker_id} "
-                        "received None combined_metadata"
-                    )
-                    break
-                start, end, metadata_dict = combined_metadata
-                ret_mask[start:end] = True
+                return
 
-                # Create tensor and receive data
+            # Compute total receive buffer size from metadata
+            total_numel = sum(
+                int(MemoryObjMetadata.from_dict(md).get_size())
+                for _, _, md in all_metadata
+            )
+
+            # Grow recv pool buffer once for the whole batch
+            if (
+                self._recv_pool_buf is None
+                or self._recv_pool_buf.numel() < total_numel
+                or self._recv_pool_buf.device != torch.device(recv_device)
+            ):
+                new_size = int(1.5 * total_numel) if total_numel > 0 else 1
+                self._recv_pool_buf = torch.empty(
+                    new_size, dtype=torch.uint8, device=recv_device
+                )
+
+            # --- Collective 2: receive single contiguous tensor ---
+            if total_numel > 0:
+                self.broadcast_fn(
+                    self._recv_pool_buf[:total_numel], self.metadata.first_rank
+                )
+
+            # --- Slice buffer into per-chunk MemoryObjs ---
+            self._recv_pool_cursor = 0
+            for start, end, metadata_dict in all_metadata:
+                ret_mask[start:end] = True
                 metadata = MemoryObjMetadata.from_dict(metadata_dict)
-                # pool-sliced HBM dst; avoids per-chunk torch.empty()
                 chunk_size = int(metadata.get_size())
-                need = self._recv_pool_cursor + chunk_size
-                if (
-                    self._recv_pool_buf is None
-                    or self._recv_pool_buf.numel() < need
-                    or self._recv_pool_buf.device != torch.device(recv_device)
-                ):
-                    new_size = int(1.5 * need)
-                    self._recv_pool_buf = torch.empty(
-                        new_size, dtype=torch.uint8, device=recv_device
-                    )
                 raw_tensor = self._recv_pool_buf[
                     self._recv_pool_cursor : self._recv_pool_cursor + chunk_size
                 ]
                 self._recv_pool_cursor += chunk_size
-                self.broadcast_fn(raw_tensor, self.metadata.first_rank)
-
-                # Create temporary memory object (key not needed for other ranks)
                 memory_obj = TensorMemoryObj(
                     raw_data=raw_tensor, metadata=metadata, parent_allocator=None
                 )
