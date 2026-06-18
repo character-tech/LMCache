@@ -649,20 +649,32 @@ class LMCacheEngine:
         # copies; the background thread synchronizes on it before reading the
         # pinned CPU buffers.
         transfer_spec = kwargs.get("transfer_spec", None)
-        self._store_queue.put(
-            (
-                keys,
-                memory_objs,
-                transfer_spec,
-                self.store_location,
-                store_stats,
-                tot_token_num,
-                num_to_store_tokens,
-                tot_kv_size,
-                req_id,
-                d2h_event,
-            )
+        item = (
+            keys,
+            memory_objs,
+            transfer_spec,
+            self.store_location,
+            store_stats,
+            tot_token_num,
+            num_to_store_tokens,
+            tot_kv_size,
+            req_id,
+            d2h_event,
         )
+        try:
+            self._store_queue.put_nowait(item)
+        except queue.Full:
+            # Background thread is backed up; drop this store rather than
+            # blocking the engine thread.  The prefix will be recomputed on
+            # next access — no correctness issue, just a cache miss.
+            logger.warning(
+                "[req_id=%s] Store queue full (maxsize=%d), dropping store "
+                "to avoid blocking engine thread.",
+                req_id,
+                self._store_queue.maxsize,
+            )
+            for mo in memory_objs:
+                mo.ref_count_down()
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()

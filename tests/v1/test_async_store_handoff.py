@@ -323,6 +323,38 @@ def test_none_d2h_event_skips_synchronize():
     engine.shutdown()
 
 
+def test_store_queue_full_drops_and_calls_ref_count_down():
+    """Queue full: put_nowait drops the item and ref_count_down is called."""
+    barrier = threading.Event()
+    engine = FakeEngine()
+    # Shrink to maxsize=1 so it fills immediately
+    engine._store_queue = queue.Queue(maxsize=1)
+
+    # First item blocks the worker indefinitely, filling the queue
+    engine.storage_manager.batched_put.side_effect = lambda *a, **kw: barrier.wait(
+        timeout=10
+    )
+    engine._store_queue.put(_make_work_item("req-fill"))
+
+    # Now try to enqueue via put_nowait — should raise queue.Full
+    memory_objs = [MagicMock()]
+    dropped = False
+    try:
+        engine._store_queue.put_nowait(_make_work_item("req-drop"))
+    except queue.Full:
+        dropped = True
+        for mo in memory_objs:
+            mo.ref_count_down()
+
+    assert dropped, "put_nowait should have raised queue.Full"
+    for mo in memory_objs:
+        mo.ref_count_down.assert_called_once()
+
+    # Unblock and clean up
+    barrier.set()
+    engine.shutdown()
+
+
 def test_multiple_items_all_processed():
     """All enqueued items must be processed, preserving per-req independence."""
     processed = []
