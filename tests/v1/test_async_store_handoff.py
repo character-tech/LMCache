@@ -111,7 +111,9 @@ class FakeEngine:
         )
         self._store_thread.start()
 
-    # Copy the exact implementation from LMCacheEngine so tests exercise real code.
+    # Simplified stub of LMCacheEngine._background_store_worker for testing.
+    # Omits logging and slow-put warnings; exception handling is intentionally
+    # silent so tests can assert on call counts without noise.
     def _background_store_worker(self) -> None:
         """Daemon thread that executes batched_put work items."""
         while True:
@@ -140,7 +142,7 @@ class FakeEngine:
                     )
                 self.stats_monitor.on_store_finished(store_stats, tot_token_num)
             except Exception:
-                pass
+                pass  # intentionally suppressed; tests assert via call counts
             finally:
                 self._store_queue.task_done()
 

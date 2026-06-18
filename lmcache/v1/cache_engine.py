@@ -233,7 +233,8 @@ class LMCacheEngine:
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
 
-        # Background thread: offloads CPU batched_put from engine thread after D2H fence.
+        # Background thread: offloads CPU batched_put from engine thread
+        # after D2H fence.
         self._store_queue: queue.Queue = queue.Queue()
         self._store_thread = threading.Thread(
             target=self._background_store_worker,
