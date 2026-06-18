@@ -233,10 +233,7 @@ class LMCacheEngine:
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
 
-        # Background store thread for async batched_put handoff.
-        # After GPU D2H copies complete on the engine thread, the CPU-only
-        # batched_put work is dispatched here so the engine thread can
-        # return to processing new requests immediately.
+        # Background thread: offloads CPU batched_put from engine thread after D2H fence.
         self._store_queue: queue.Queue = queue.Queue()
         self._store_thread = threading.Thread(
             target=self._background_store_worker,
@@ -250,7 +247,6 @@ class LMCacheEngine:
         while True:
             item = self._store_queue.get()
             if item is None:
-                # Shutdown sentinel
                 break
             req_id = "<unknown>"
             try:
@@ -266,9 +262,7 @@ class LMCacheEngine:
                     req_id,
                 ) = item
                 with store_stats.profile_put():
-                    assert self.storage_manager is not None, (
-                        "storage_manager must not be None in background store worker"
-                    )
+                    assert self.storage_manager is not None
                     self.storage_manager.batched_put(
                         keys,
                         memory_objs,
