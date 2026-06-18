@@ -236,9 +236,6 @@ class LMCacheEngine:
         # Background thread: offloads CPU batched_put from engine thread
         # after D2H fence.
         self._store_queue: queue.Queue = queue.Queue()
-        self._store_consecutive_failures: int = 0
-        # Mirror DEFAULT_GET_BLOCKING_FAILED_THRESHOLD from health_monitor.
-        self._store_failure_threshold: int = 10
         self._store_thread = threading.Thread(
             target=self._background_store_worker,
             name="lmcache-bg-store",
@@ -302,22 +299,10 @@ class LMCacheEngine:
                     * 1000,
                     store_stats.put_time * 1000,
                 )
-                self._store_consecutive_failures = 0
             except Exception:
                 logger.exception(
                     "Error in background store worker for req_id=%s", req_id
                 )
-                self._store_consecutive_failures += 1
-                if (
-                    self._store_consecutive_failures >= self._store_failure_threshold
-                    and self._health_monitor is not None
-                ):
-                    logger.error(
-                        "Background store failed %d consecutive times; "
-                        "signaling health monitor to degrade.",
-                        self._store_consecutive_failures,
-                    )
-                    self._health_monitor._set_healthy(False)
             finally:
                 self._store_queue.task_done()
 
