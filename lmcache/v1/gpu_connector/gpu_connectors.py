@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 import abc
 import time
 
@@ -76,7 +76,7 @@ class GPUConnectorInterface(metaclass=abc.ABCMeta):
         starts: List[int],
         ends: List[int],
         **kwargs,
-    ) -> Optional[torch.cuda.Event]:
+    ) -> Any:
         """
         Batched load the data from a GPU memory into the memory objects.
         Sub-classes should define the format of the kwargs.
