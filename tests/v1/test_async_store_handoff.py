@@ -78,7 +78,7 @@ def make_store_stats() -> StoreRequestStats:
     )
 
 
-def _make_work_item(req_id: str = "req-1", batched_put_delay: float = 0.0):
+def _make_work_item(req_id: str = "req-1"):
     """Build a tuple matching the format enqueued by LMCacheEngine.store()."""
     keys = ["key1"]
     memory_objs = [MagicMock()]
