@@ -266,6 +266,9 @@ class LMCacheEngine:
                     req_id,
                 ) = item
                 with store_stats.profile_put():
+                    assert self.storage_manager is not None, (
+                        "storage_manager must not be None in background store worker"
+                    )
                     self.storage_manager.batched_put(
                         keys,
                         memory_objs,
@@ -479,9 +482,9 @@ class LMCacheEngine:
             logger.warning("LMCache is unhealthy, skipping store operation")
             return
 
-        assert (
-            self.gpu_connector is not None
-        ), "gpu_connector is required for store operation"
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for store operation"
+        )
 
         if self._is_passive():
             logger.debug(f"rank={self.metadata.worker_id} ignore store")
@@ -500,17 +503,17 @@ class LMCacheEngine:
         elif tokens is not None:
             num_to_store_tokens = len(tokens)
         elif hashes is not None:
-            assert (
-                offsets is not None
-            ), "Offsets should be set when hashes are provided during store"
+            assert offsets is not None, (
+                "Offsets should be set when hashes are provided during store"
+            )
             num_to_store_tokens = sum(offsets)
             kwargs["slot_mapping"] = torch.tensor(
                 kwargs["slot_mapping"], dtype=torch.long, device="cuda"
             )
 
-        assert (
-            tokens is not None or hashes is not None
-        ), "Either 'tokens' or 'hashes' must be provided."
+        assert tokens is not None or hashes is not None, (
+            "Either 'tokens' or 'hashes' must be provided."
+        )
 
         # KVCache Check logging
         self._log_kvcache_for_check(
@@ -673,9 +676,9 @@ class LMCacheEngine:
             return
 
         assert self.storage_manager is not None
-        assert (
-            self.gpu_connector is not None
-        ), "gpu_connector is required for store_layer operation"
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for store_layer operation"
+        )
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
@@ -859,9 +862,9 @@ class LMCacheEngine:
             logger.warning("LMCache is unhealthy, skipping retrieve operation")
             return torch.zeros(len(tokens), dtype=torch.bool)
 
-        assert (
-            self.gpu_connector is not None
-        ), "gpu_connector is required for retrieve operation"
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for retrieve operation"
+        )
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
@@ -889,13 +892,11 @@ class LMCacheEngine:
         if not self._is_passive():
             with retrieve_stats.profile_process_tokens():
                 if self.async_loading:
-                    reordered_chunks, tot_kv_size = (
-                        self._async_process_tokens_internal(  # noqa: E501
-                            tokens,
-                            mask,
-                            ret_mask,
-                            **kwargs,
-                        )
+                    reordered_chunks, tot_kv_size = self._async_process_tokens_internal(  # noqa: E501
+                        tokens,
+                        mask,
+                        ret_mask,
+                        **kwargs,
                     )
                 else:
                     reordered_chunks, tot_kv_size = self._process_tokens_internal(
@@ -1012,9 +1013,9 @@ class LMCacheEngine:
             return
 
         assert self.storage_manager is not None
-        assert (
-            self.gpu_connector is not None
-        ), "gpu_connector is required for retrieve_layer operation"
+        assert self.gpu_connector is not None, (
+            "gpu_connector is required for retrieve_layer operation"
+        )
 
         # Get req_id for logging
         req_id = self._get_req_id(kwargs)
@@ -1212,9 +1213,9 @@ class LMCacheEngine:
                     # we consider this key as a hit
                     if hit_chunks == self.num_layers and len(block_mapping) == 1:
                         if pin:
-                            assert (
-                                lookup_id is not None
-                            ), "lookup_id is required when pin is True"
+                            assert lookup_id is not None, (
+                                "lookup_id is required when pin is True"
+                            )
                             location = next(iter(block_mapping.keys()))
                             self.lookup_pins[lookup_id][location].extend(key_all_layers)
                         res = end
@@ -1235,9 +1236,9 @@ class LMCacheEngine:
                     keys, search_range, pin
                 )
                 if pin and block_mapping:
-                    assert (
-                        lookup_id is not None
-                    ), "lookup_id is required when pin is True"
+                    assert lookup_id is not None, (
+                        "lookup_id is required when pin is True"
+                    )
                     self.lookup_pins[lookup_id] = block_mapping
                 for idx, (start, end, key) in enumerate(chunk_info_list):
                     if idx < hit_chunks:
@@ -1444,9 +1445,9 @@ class LMCacheEngine:
             keys=keys,
             location=location,
         )
-        assert (
-            None not in memory_objs
-        ), "LMCacheEngine.compress: Failed to get memory objects to compress"
+        assert None not in memory_objs, (
+            "LMCacheEngine.compress: Failed to get memory objects to compress"
+        )
 
         compressed_memory_objs = []
         for memory_obj in memory_objs:

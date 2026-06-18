@@ -5,23 +5,19 @@ These tests exercise _background_store_worker, _drain_store_queue, and the
 close() shutdown sequence using mocked storage_manager and stats_monitor so
 no CUDA device or real backend is required.
 """
+
 # Standard
+from contextlib import contextmanager
+from dataclasses import dataclass
+from unittest.mock import MagicMock
 import queue
 import threading
 import time
-from contextlib import contextmanager
-from unittest.mock import MagicMock
-
-# Third Party
-
 
 # ---------------------------------------------------------------------------
 # Minimal StoreRequestStats stub (avoids importing observability.py which
 # requires prometheus_client not present in the unit-test environment).
 # ---------------------------------------------------------------------------
-
-
-from dataclasses import dataclass
 
 
 @dataclass
@@ -231,12 +227,12 @@ def test_shutdown_drains_queue_before_stopping():
 
     engine.shutdown()
 
-    assert (
-        not engine._store_thread.is_alive()
-    ), "worker thread still alive after shutdown"
-    assert (
-        len(completed_reqs) == 5
-    ), f"expected 5 batched_put calls, got {len(completed_reqs)}"
+    assert not engine._store_thread.is_alive(), (
+        "worker thread still alive after shutdown"
+    )
+    assert len(completed_reqs) == 5, (
+        f"expected 5 batched_put calls, got {len(completed_reqs)}"
+    )
 
 
 def test_shutdown_stops_worker_thread():
@@ -297,8 +293,8 @@ def test_multiple_items_all_processed():
     """All enqueued items must be processed, preserving per-req independence."""
     processed = []
     engine = FakeEngine()
-    engine.storage_manager.batched_put.side_effect = (
-        lambda keys, *a, **kw: processed.append(keys[0])
+    engine.storage_manager.batched_put.side_effect = lambda keys, *a, **kw: (
+        processed.append(keys[0])
     )
 
     items = [_make_work_item(f"req-{i}") for i in range(10)]
