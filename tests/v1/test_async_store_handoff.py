@@ -74,7 +74,7 @@ def make_store_stats() -> StoreRequestStats:
     )
 
 
-def _make_work_item(req_id: str = "req-1"):
+def _make_work_item(req_id: str = "req-1", d2h_event=None):
     """Build a tuple matching the format enqueued by LMCacheEngine.store()."""
     keys = ["key1"]
     memory_objs = [MagicMock()]
@@ -94,6 +94,7 @@ def _make_work_item(req_id: str = "req-1"):
         num_to_store_tokens,
         tot_kv_size,
         req_id,
+        d2h_event,
     )
 
 
@@ -132,7 +133,10 @@ class FakeEngine:
                     num_to_store_tokens,
                     tot_kv_size,
                     req_id,
+                    d2h_event,
                 ) = item
+                if d2h_event is not None:
+                    d2h_event.synchronize()
                 with store_stats.profile_put():
                     self.storage_manager.batched_put(
                         keys,
@@ -288,6 +292,34 @@ def test_on_store_finished_called_after_put():
     engine._drain_store_queue()
 
     assert order == ["put", "finish"], f"unexpected order: {order}"
+    engine.shutdown()
+
+
+def test_d2h_event_synchronized_before_batched_put():
+    """event.synchronize() must be called before batched_put reads the buffer."""
+    order = []
+    engine = FakeEngine()
+
+    event = MagicMock()
+    event.synchronize.side_effect = lambda: order.append("sync")
+    engine.storage_manager.batched_put.side_effect = lambda *a, **kw: order.append(
+        "put"
+    )
+
+    engine._store_queue.put(_make_work_item("req-event", d2h_event=event))
+    engine._drain_store_queue()
+
+    assert order == ["sync", "put"], f"unexpected order: {order}"
+    engine.shutdown()
+
+
+def test_none_d2h_event_skips_synchronize():
+    """When d2h_event is None (all-GPU batch), synchronize must not be called."""
+    engine = FakeEngine()
+    engine._store_queue.put(_make_work_item("req-no-event", d2h_event=None))
+    engine._drain_store_queue()
+    # If we get here without AttributeError on None.synchronize(), the guard works.
+    engine.storage_manager.batched_put.assert_called_once()
     engine.shutdown()
 
 

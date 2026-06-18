@@ -235,7 +235,7 @@ class LMCacheEngine:
 
         # Background thread: offloads CPU batched_put from engine thread
         # after D2H fence.
-        self._store_queue: queue.Queue = queue.Queue()
+        self._store_queue: queue.Queue = queue.Queue(maxsize=16)
         self._store_consecutive_failures: int = 0
         # Mirror DEFAULT_GET_BLOCKING_FAILED_THRESHOLD from health_monitor.
         self._store_failure_threshold: int = 10
@@ -264,7 +264,13 @@ class LMCacheEngine:
                     num_to_store_tokens,
                     tot_kv_size,
                     req_id,
+                    d2h_event,
                 ) = item
+                # CPU-block on this background thread (not the engine thread)
+                # until the D2H DMA on store_stream has fully landed in the
+                # pinned CPU buffer before batched_put reads it.
+                if d2h_event is not None:
+                    d2h_event.synchronize()
                 with store_stats.profile_put():
                     assert self.storage_manager is not None
                     self.storage_manager.batched_put(
@@ -630,13 +636,18 @@ class LMCacheEngine:
             return
 
         with store_stats.profile_from_gpu():
-            self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
+            d2h_event = self.gpu_connector.batched_from_gpu(
+                memory_objs, starts, ends, **kwargs
+            )
 
         # Hand off the CPU-only batched_put work to the background store
         # thread so the engine thread can return immediately and serve the
         # next retrieve without blocking.  Memory objects remain alive
         # (ref_count >= 1 from allocation) until batched_put calls
         # ref_count_down in the background thread.
+        # d2h_event is a CUDA Event recorded on store_stream after all D2H
+        # copies; the background thread synchronizes on it before reading the
+        # pinned CPU buffers.
         transfer_spec = kwargs.get("transfer_spec", None)
         self._store_queue.put(
             (
@@ -649,6 +660,7 @@ class LMCacheEngine:
                 num_to_store_tokens,
                 tot_kv_size,
                 req_id,
+                d2h_event,
             )
         )
 

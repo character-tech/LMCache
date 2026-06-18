@@ -421,11 +421,17 @@ class VLLMPagedMemGPUConnectorV2(GPUConnectorInterface):
     def batched_from_gpu(self, memory_objs, starts, ends, **kwargs):
         for memory_obj, start, end in zip(memory_objs, starts, ends, strict=False):
             self.from_gpu(memory_obj, start, end, **kwargs)
-        # Device-side fence instead of per-memobj CPU-blocking synchronize().
-        # Fence if ANY target is host memory so a heterogeneous batch can't
-        # silently skip the D2H wait and corrupt KV data.
+        # Device-side fence: prevents the compute stream from overwriting GPU
+        # KV pages before store_stream D2H completes.
+        # Also records a CUDA Event so the background store thread can
+        # CPU-block on it before reading the pinned buffer — moving the
+        # host-visible fence off the engine thread.
+        d2h_event = None
         if any(mo.tensor is not None and not mo.tensor.is_cuda for mo in memory_objs):
             torch.cuda.current_stream().wait_stream(self.store_stream)
+            d2h_event = torch.cuda.Event()
+            d2h_event.record(self.store_stream)
+        return d2h_event
 
     def get_shape(self, num_tokens: int) -> torch.Size:
         kv_size = 1 if self.use_mla else 2
