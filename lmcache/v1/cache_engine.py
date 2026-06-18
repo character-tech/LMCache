@@ -235,7 +235,7 @@ class LMCacheEngine:
 
         # Background thread: offloads CPU batched_put from engine thread
         # after D2H fence.
-        self._store_queue: queue.Queue = queue.Queue(maxsize=16)
+        self._store_queue: queue.Queue = queue.Queue(maxsize=64)
         self._store_consecutive_failures: int = 0
         # Mirror DEFAULT_GET_BLOCKING_FAILED_THRESHOLD from health_monitor.
         self._store_failure_threshold: int = 10
