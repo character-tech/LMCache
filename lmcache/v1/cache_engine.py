@@ -22,6 +22,8 @@ if TYPE_CHECKING:
 import asyncio
 import gc
 import multiprocessing
+import queue
+import threading
 import time
 
 # Third Party
@@ -224,6 +226,84 @@ class LMCacheEngine:
 
         # Flag to indicate if initialization failed (irrecoverable error)
         self._init_failed = False
+
+        # Background store thread for async batched_put handoff.
+        # After GPU D2H copies complete on the engine thread, the CPU-only
+        # batched_put work is dispatched here so the engine thread can
+        # return to processing new requests immediately.
+        self._store_queue: queue.Queue = queue.Queue()
+        self._store_thread = threading.Thread(
+            target=self._background_store_worker,
+            name="lmcache-bg-store",
+            daemon=True,
+        )
+        self._store_thread.start()
+
+    def _background_store_worker(self) -> None:
+        """Daemon thread that executes batched_put work items."""
+        while True:
+            item = self._store_queue.get()
+            if item is None:
+                # Shutdown sentinel
+                break
+            try:
+                (
+                    keys,
+                    memory_objs,
+                    transfer_spec,
+                    store_location,
+                    store_stats,
+                    tot_token_num,
+                    num_to_store_tokens,
+                    tot_kv_size,
+                    req_id,
+                ) = item
+                with store_stats.profile_put():
+                    self.storage_manager.batched_put(
+                        keys,
+                        memory_objs,
+                        transfer_spec=transfer_spec,
+                        location=store_location,
+                    )
+
+                if store_stats.put_time > 0.5:
+                    logger.warning(
+                        "[req_id=%s] Background batched_put took %.1f ms "
+                        "(threshold 500 ms)",
+                        req_id,
+                        store_stats.put_time * 1000,
+                    )
+
+                self.stats_monitor.on_store_finished(
+                    store_stats,
+                    tot_token_num,
+                )
+                tot_time = store_stats.time_to_store()
+
+                logger.info(
+                    "[req_id=%s] Stored %d out of total %d tokens. "
+                    "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
+                    "offload_time: %.4f ms, put_time: %.4f ms",
+                    req_id,
+                    tot_token_num,
+                    num_to_store_tokens,
+                    tot_kv_size / 1024**3,
+                    tot_time * 1000,
+                    tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
+                    (store_stats.process_tokens_time + store_stats.from_gpu_time)
+                    * 1000,
+                    store_stats.put_time * 1000,
+                )
+            except Exception:
+                logger.exception(
+                    "Error in background store worker for req_id=%s", req_id
+                )
+            finally:
+                self._store_queue.task_done()
+
+    def _drain_store_queue(self) -> None:
+        """Block until all pending background store work completes."""
+        self._store_queue.join()
 
     def set_health_monitor(self, health_monitor: "HealthMonitor") -> None:
         """
@@ -532,36 +612,23 @@ class LMCacheEngine:
         with store_stats.profile_from_gpu():
             self.gpu_connector.batched_from_gpu(memory_objs, starts, ends, **kwargs)
 
-        with store_stats.profile_put():
-            transfer_spec = kwargs.get("transfer_spec", None)
-            # TODO: we implicitly rely on batched_put to call ref_count_down
-            # this management should be done in a cleaner way
-            self.storage_manager.batched_put(
-                keys,
-                memory_objs,
-                transfer_spec=transfer_spec,
-                location=self.store_location,
-            )
-
-        self.stats_monitor.on_store_finished(
+        # Hand off the CPU-only batched_put work to the background store
+        # thread so the engine thread can return immediately and serve the
+        # next retrieve without blocking.  Memory objects remain alive
+        # (ref_count >= 1 from allocation) until batched_put calls
+        # ref_count_down in the background thread.
+        transfer_spec = kwargs.get("transfer_spec", None)
+        self._store_queue.put((
+            keys,
+            memory_objs,
+            transfer_spec,
+            self.store_location,
             store_stats,
             tot_token_num,
-        )
-        tot_time = store_stats.time_to_store()
-
-        logger.info(
-            "[req_id=%s] Stored %d out of total %d tokens. "
-            "size: %.4f GB, cost %.4f ms, throughput: %.4f GB/s; "
-            "offload_time: %.4f ms, put_time: %.4f ms",
-            req_id,
-            tot_token_num,
             num_to_store_tokens,
-            tot_kv_size / 1024**3,
-            tot_time * 1000,
-            tot_kv_size / tot_time / 1024**3 if tot_time > 0 else 0,
-            (store_stats.process_tokens_time + store_stats.from_gpu_time) * 1000,
-            store_stats.put_time * 1000,
-        )
+            tot_kv_size,
+            req_id,
+        ))
 
     @_lmcache_nvtx_annotate
     @torch.inference_mode()
@@ -1521,6 +1588,20 @@ class LMCacheEngine:
     def close(self) -> None:
         """Close the cache engine and free all the resources"""
         logger.info("Closing LMCacheEngine...")
+
+        # Drain pending background stores before tearing down backends
+        try:
+            logger.info("Draining background store queue...")
+            self._drain_store_queue()
+            self._store_queue.put(None)  # shutdown sentinel
+            self._store_thread.join(timeout=10)
+            if self._store_thread.is_alive():
+                logger.warning(
+                    "Background store thread did not exit within timeout"
+                )
+            logger.info("Background store thread stopped")
+        except Exception as e:
+            logger.error("Error stopping background store thread: %s", e)
 
         if self.lmcache_worker is not None:
             try:
