@@ -2,7 +2,7 @@
 #
 # Reproduces the LMCache-team-verified stack (Shaoting Feng, Yihua Cheng):
 #   ROCm 7.0.2 (HIP 7.0.51831) + torch 2.10.0+rocm7.0 + vLLM 0.19.0 +
-#   LMCache 0.4.4. Our prod stack on rocm7.2 hits hipErrorInvalidDevicePointer
+#   LMCache 0.4.7. Our prod stack on rocm7.2 hits hipErrorInvalidDevicePointer
 #   on every REGISTER_KV_CACHE; this image isolates the ROCm version.
 #
 # Build recipe follows the amd4 dev pod's verified-working sequence

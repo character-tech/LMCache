@@ -20,7 +20,7 @@ VLLM_BRANCH="${VLLM_BRANCH:-cai-v0.19.0}"
 # Version slugs used in the descriptive image tag. Derived from branch
 # names by default (cai-v0.19.0 → 0.19.0, cai-v0.4.4 → 0.4.4).
 VLLM_VER="${VLLM_VER:-${VLLM_BRANCH#cai-v}}"
-LMCACHE_VER="${LMCACHE_VER:-0.4.4}"
+LMCACHE_VER="${LMCACHE_VER:-0.4.7}"
 ROCM_VER="${ROCM_VER:-rocm7.0.2}"
 TORCH_VER="${TORCH_VER:-torch2.10.0}"
 
