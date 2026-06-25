@@ -41,20 +41,39 @@ def _make_kv_tensors(
 def mock_gpu_ctx():
     """Create a mock GPUCacheContext with kv_tensors."""
     ctx = MagicMock()
-    type(ctx).kv_tensors = PropertyMock(
-        return_value=_make_kv_tensors(),
-    )
+    tensors = _make_kv_tensors()
+    type(ctx).kv_tensors = PropertyMock(return_value=tensors)
     type(ctx).block_size = PropertyMock(return_value=4)
-    # KV tensors are built as [2, NB, BS, NH, HS] -> NL_X_TWO_NB_BS_NH_HS.
-    ctx.engine_kv_format_ = lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+    # KV tensors are built as [2, NB, BS, NH, HS] -> NL_X_TWO_NB_BS_NH_HS;
+    # one homogeneous kernel group, so every layer reports the same format.
+    fmt = lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS
+    ctx.engine_kv_formats.return_value = [fmt]
+    ctx.engine_kv_format_per_layer.return_value = [fmt] * len(tensors)
     return ctx
 
 
 @pytest.fixture
-def mock_engine(mock_gpu_ctx):
-    """Create a mock engine with gpu_contexts."""
+def mock_mixed_engine():
+    """Engine whose context mixes two KV formats (a key+value layer and a
+    key-only layer), so the endpoint gathers each along its own axis."""
+    ctx = MagicMock()
+    kv_kv = torch.randn(2, 4, 4, 2, 8)
+    kv_idx = torch.randn(4, 4, 8)
+    type(ctx).kv_tensors = PropertyMock(return_value=[kv_kv, kv_idx])
+    ctx.engine_kv_format_per_layer.return_value = [
+        lmc_ops.EngineKVFormat.NL_X_TWO_NB_BS_NH_HS,
+        lmc_ops.EngineKVFormat.NL_X_NB_BS_HS,
+    ]
     engine = MagicMock()
-    engine.gpu_contexts = {0: mock_gpu_ctx}
+    engine.cache_contexts = {0: ctx}
+    return engine
+
+
+@pytest.fixture
+def mock_engine(mock_gpu_ctx):
+    """Create a mock engine with cache_contexts."""
+    engine = MagicMock()
+    engine.cache_contexts = {0: mock_gpu_ctx}
     return engine
 
 
@@ -111,6 +130,21 @@ class TestKVCacheCheckEndpoint:
         d2 = client_with_engine.get(url).json()
         assert d1["chunk_checksums"] == d2["chunk_checksums"]
 
+    def test_mixed_format_supported(self, mock_mixed_engine):
+        """Two different KV formats are gathered per layer, not rejected."""
+        app.state.engine = mock_mixed_engine
+        client = TestClient(app)
+        try:
+            resp = client.get("/kvcache/check?block_ids=0&chunk_size=1&layerwise=true")
+        finally:
+            client.close()
+            app.state.engine = None
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "success"
+        # Both layers checksummed despite different formats / block axes.
+        assert set(data["chunk_checksums"]) == {"layer_0", "layer_1"}
+
     def test_range_block_ids(self, client_with_engine):
         """Range format [0,1] is accepted for block_ids."""
         resp = client_with_engine.get("/kvcache/check?block_ids=[0,1]&chunk_size=1")
@@ -136,9 +170,9 @@ class TestKVCacheCheckEndpoint:
         resp = client_no_engine.get("/kvcache/check?block_ids=0&chunk_size=1")
         assert resp.status_code == 503
 
-    def test_no_gpu_contexts(self, client_with_engine, mock_engine):
-        """501 when engine has no gpu_contexts attribute."""
-        mock_engine.gpu_contexts = None
+    def test_no_cache_contexts(self, client_with_engine, mock_engine):
+        """501 when engine has no cache_contexts attribute."""
+        mock_engine.cache_contexts = None
         resp = client_with_engine.get("/kvcache/check?block_ids=0&chunk_size=1")
         assert resp.status_code == 501
 
