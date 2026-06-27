@@ -30,10 +30,6 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
 from lmcache.v1.mp_observability.otel_init import register_gauge
-from lmcache.v1.platform import (
-    consume_fd,
-    create_event_notifier,
-)
 
 logger = init_logger(__name__)
 
