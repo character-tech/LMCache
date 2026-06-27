@@ -816,7 +816,9 @@ class PrefetchController(StorageControllerInterface):
                             "request_id": request.request_id,
                             "adapter_index": adapter_index,
                             "task_id": task_id,
-                            "l2_name": self._adapter_descriptors[adapter_index].type_name,
+                            "l2_name": self._adapter_descriptors[
+                                adapter_index
+                            ].type_name,
                         },
                     )
                 )

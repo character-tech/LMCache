@@ -10,6 +10,7 @@ The controller runs a background thread with an event-driven loop that:
 """
 
 # Standard
+from collections import defaultdict
 from dataclasses import dataclass
 import os
 import select
@@ -150,7 +151,6 @@ class InFlightStoreTask:
     means the adapter does not track per-task transfer bytes (default
     behavior for non fast-path adapters); consumers fall back to the
     submitted-bytes count from the SUBMITTED event."""
-
 
 
 # Main class

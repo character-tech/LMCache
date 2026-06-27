@@ -781,8 +781,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
             # pre-alloc loop above, so the size lists stay aligned even
             # when the pool ran out of slots mid-batch.
             if stored_keys:
-                stored_sizes = [obj.size for obj in storage_objs]
-                self._notify_keys_stored(stored_keys, stored_sizes)
+                self._notify_keys_stored(stored_keys)
             bytes_transferred = sum(obj.size for obj in storage_objs)
 
         # success is only set to false for transfer failures

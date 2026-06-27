@@ -639,7 +639,7 @@ class FSL2Adapter(L2AdapterInterface):
         with self._lock:
             self._completed_store_tasks[task_id] = success
             self._completed_store_task_bytes[task_id] = bytes_written
-        self._store_efd.notify()
+        os.eventfd_write(self._store_efd, 1)
 
     # ---- lookup ---------------------------------------------------------
 
