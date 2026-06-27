@@ -18,6 +18,11 @@ these events see [METRICS.md](METRICS.md).
 | `L1_WRITE_FINISHED` | `keys` | `list[ObjectKey]` |
 | `L1_WRITE_FINISHED_AND_READ_RESERVED` | `keys` | `list[ObjectKey]` |
 | `L1_KEYS_EVICTED` | `keys` | `list[ObjectKey]` |
+| `L1_EVICTION_LOOP_TICK` | `usage`, `watermark`, `triggered` | `float`, `float`, `bool` |
+
+`L1_EVICTION_LOOP_TICK` fires once per `L1EvictionController.eviction_loop`
+iteration (default ~1Hz).  `triggered` is `True` when `usage >= watermark`
+and the policy ran this cycle, `False` otherwise.
 
 ---
 

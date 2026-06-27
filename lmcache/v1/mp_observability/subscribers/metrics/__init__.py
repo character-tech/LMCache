@@ -11,6 +11,9 @@ from lmcache.v1.mp_observability.subscribers.metrics.l0_lifecycle import (
     L0LifecycleSubscriber,
 )
 from lmcache.v1.mp_observability.subscribers.metrics.l1 import L1MetricsSubscriber
+from lmcache.v1.mp_observability.subscribers.metrics.l1_eviction_loop import (
+    L1EvictionLoopSubscriber,
+)
 from lmcache.v1.mp_observability.subscribers.metrics.l1_failures import (
     L1FailureMetricsSubscriber,
 )
@@ -36,6 +39,7 @@ __all__ = [
     "EventBusSelfMetricsSubscriber",
     "L0L1ThroughputSubscriber",
     "L0LifecycleSubscriber",
+    "L1EvictionLoopSubscriber",
     "L1FailureMetricsSubscriber",
     "L1LifecycleSubscriber",
     "L1MetricsSubscriber",
