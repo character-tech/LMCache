@@ -10,6 +10,7 @@ The controller runs a background thread with an event-driven loop that:
 """
 
 # Standard
+from collections import defaultdict
 from dataclasses import dataclass
 import os
 import select
@@ -29,6 +30,7 @@ from lmcache.v1.distributed.storage_controllers.store_policy import (
 )
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
+from lmcache.v1.mp_observability.otel_init import register_gauge
 
 logger = init_logger(__name__)
 
@@ -141,6 +143,15 @@ class InFlightStoreTask:
     """The subset of keys for which reserve_read succeeded
     (i.e., keys holding an L1 read lock that must be released)."""
 
+    l2_store_result: bool | None = None
+    """L2 outcome (True=success, False=failure, None=still in flight)."""
+
+    l2_bytes_transferred: int | None = None
+    """Bytes actually transferred by the adapter for this task.  ``None``
+    means the adapter does not track per-task transfer bytes (default
+    behavior for non fast-path adapters); consumers fall back to the
+    submitted-bytes count from the SUBMITTED event."""
+
 
 # Main class
 
@@ -168,6 +179,13 @@ class StoreController(StorageControllerInterface):
         policy: The store policy for deciding targets and deletions.
     """
 
+    # Singleton dispatch for ``lmcache_mp.num_inflight_l2_stores``: tests may
+    # construct multiple controllers but the OTel SDK only honors the first
+    # gauge registration, so the callback reads from the most recently built
+    # instance via ``_gauge_target``.
+    _gauge_registered: bool = False
+    _gauge_target: "StoreController | None" = None
+
     def __init__(
         self,
         l1_manager: L1Manager,
@@ -191,6 +209,20 @@ class StoreController(StorageControllerInterface):
 
         # Shadow counter for status reporting (updated in background loop)
         self._status_in_flight_count: int = 0
+
+        StoreController._gauge_target = self
+        if not StoreController._gauge_registered:
+            StoreController._gauge_registered = True
+            register_gauge(
+                "lmcache.l2_store",
+                "lmcache_mp.num_inflight_l2_stores",
+                "L2 store tasks currently executing, per adapter",
+                lambda: (
+                    StoreController._gauge_target.get_inflight_stores_observations()
+                    if StoreController._gauge_target is not None
+                    else []
+                ),
+            )
 
         # Map eventfd -> adapter index for quick lookup in poll results
         self._efd_to_adapter_index: dict[int, int] = {}
@@ -233,6 +265,31 @@ class StoreController(StorageControllerInterface):
             "in_flight_task_count": self._status_in_flight_count,
             "num_l2_adapters": len(self._l2_adapters),
         }
+
+    def get_inflight_stores_observations(
+        self,
+    ) -> list[tuple[int | float, dict[str, object]]]:
+        """Per-adapter ``(count, attributes)`` snapshot for the
+        ``lmcache_mp.num_inflight_l2_stores`` gauge.
+
+        ``dict.copy()`` is GIL-atomic in CPython, so reading from the
+        OTel reader thread while the store loop mutates is safe; the
+        snapshot may be one mutation stale, which is fine at the 10 s
+        scrape cadence.
+        """
+        counts: dict[int, int] = defaultdict(int)
+        for adapter_index, _ in self._in_flight_tasks.copy():
+            counts[adapter_index] += 1
+        return [
+            (
+                count,
+                {
+                    "l2_name": self._adapter_descriptors[idx].type_name,
+                    "adapter_index": idx,
+                },
+            )
+            for idx, count in counts.items()
+        ]
 
     # Private methods
 
@@ -316,12 +373,18 @@ class StoreController(StorageControllerInterface):
 
             successful_keys = []
             successful_objs = []
+            not_found_keys: list[ObjectKey] = []
+            write_locked_keys: list[ObjectKey] = []
             for key in target_keys:
                 result = read_results.get(key)
                 if result is None:
                     continue
                 err, obj = result
                 if err != L1Error.SUCCESS or obj is None:
+                    if err == L1Error.KEY_NOT_EXIST:
+                        not_found_keys.append(key)
+                    elif err == L1Error.KEY_NOT_READABLE:
+                        write_locked_keys.append(key)
                     logger.debug(
                         "Skipping key %s for L2 store (adapter %d): %s",
                         key,
@@ -331,6 +394,32 @@ class StoreController(StorageControllerInterface):
                     continue
                 successful_keys.append(key)
                 successful_objs.append(obj)
+
+            # L1 read-failure anomaly reporting: target_keys come from an
+            # L1_WRITE_FINISHED notification, so failing to reserve_read them
+            # immediately after means an unexpected eviction or lock race.
+            if not_found_keys:
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.L1_READ_FAILED,
+                        metadata={
+                            "during": "l2_store",
+                            "reason": "not_found",
+                            "keys": not_found_keys,
+                        },
+                    )
+                )
+            if write_locked_keys:
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.L1_READ_FAILED,
+                        metadata={
+                            "during": "l2_store",
+                            "reason": "write_locked",
+                            "keys": write_locked_keys,
+                        },
+                    )
+                )
 
             if not successful_keys:
                 continue
@@ -345,12 +434,19 @@ class StoreController(StorageControllerInterface):
             )
             self._status_in_flight_count += 1
 
+            # All objects for a single store task share one layout (L1
+            # allocates uniform MemoryObjs per chunk), so total bytes is
+            # size * count — avoids summing N identical values.
+            total_bytes = successful_objs[0].get_size() * len(successful_objs)
             self._event_bus.publish(
                 Event(
                     event_type=EventType.L2_STORE_SUBMITTED,
                     metadata={
                         "adapter_index": adapter_index,
+                        "task_id": task_id,
+                        "l2_name": self._adapter_descriptors[adapter_index].type_name,
                         "key_count": len(successful_keys),
+                        "total_bytes": total_bytes,
                     },
                 )
             )
@@ -397,12 +493,27 @@ class StoreController(StorageControllerInterface):
             # Always release read locks
             l1_mgr.finish_read(task.read_locked_keys)
 
+            l2_name = self._adapter_descriptors[adapter_index].type_name
+            # Adapters that fast-path duplicate keys report ``bytes_transferred``
+            # so the L2 throughput subscriber can use real-work bytes for the
+            # histogram instead of submitted bytes (which inflates dt-based
+            # throughput when the adapter skipped the write).  Adapters that
+            # don't report bytes leave this at ``None`` -- the field is then
+            # omitted from the event so consumers fall back to the submitted
+            # bytes carried on the SUBMITTED event.
+            completion_meta: dict[str, object] = {
+                "adapter_index": adapter_index,
+                "task_id": task_id,
+                "l2_name": l2_name,
+            }
+            if task.l2_bytes_transferred is not None:
+                completion_meta["bytes_transferred"] = task.l2_bytes_transferred
             if success:
                 self._event_bus.publish(
                     Event(
                         event_type=EventType.L2_STORE_COMPLETED,
                         metadata={
-                            "adapter_index": adapter_index,
+                            **completion_meta,
                             "succeeded_count": len(task.keys),
                             "failed_count": 0,
                         },
@@ -422,7 +533,7 @@ class StoreController(StorageControllerInterface):
                     Event(
                         event_type=EventType.L2_STORE_COMPLETED,
                         metadata={
-                            "adapter_index": adapter_index,
+                            **completion_meta,
                             "succeeded_count": 0,
                             "failed_count": len(task.keys),
                         },

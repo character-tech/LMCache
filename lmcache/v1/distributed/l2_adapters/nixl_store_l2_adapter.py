@@ -435,6 +435,12 @@ class NixlStoreL2Adapter(L2AdapterInterface):
         # Task ID management
         self._next_task_id: L2TaskId = 0
         self._completed_store_tasks: dict[L2TaskId, bool] = {}
+        # Bytes actually transferred per completed store task.  Excludes
+        # keys that were fast-pathed (already present in
+        # ``_memory_objects``) and any pool-exhaustion fallouts.  Surfaces
+        # to the L2 throughput subscriber so its histogram reflects real
+        # NIXL transfers, not skipped no-ops.
+        self._completed_store_task_bytes: dict[L2TaskId, int] = {}
         self._completed_lookup_tasks: dict[L2TaskId, Bitmap] = {}
         self._completed_load_tasks: dict[L2TaskId, Bitmap] = {}
         self._lock = threading.Lock()  # lock for all shared state
@@ -511,6 +517,12 @@ class NixlStoreL2Adapter(L2AdapterInterface):
             completed = self._completed_store_tasks
             self._completed_store_tasks = {}
         return completed
+
+    def pop_completed_store_task_bytes(self) -> dict[L2TaskId, int]:
+        with self._lock:
+            completed_bytes = self._completed_store_task_bytes
+            self._completed_store_task_bytes = {}
+        return completed_bytes
 
     #####################
     # Lookup and Lock Interface
@@ -749,6 +761,7 @@ class NixlStoreL2Adapter(L2AdapterInterface):
                 # Nothing to store (all keys already existed or pool empty)
                 with self._lock:
                     self._completed_store_tasks[task_id] = True
+                    self._completed_store_task_bytes[task_id] = 0
                 self._signal_store_event()
                 return
 
@@ -764,18 +777,25 @@ class NixlStoreL2Adapter(L2AdapterInterface):
                 for key, storage_obj in zip(stored_keys, storage_objs, strict=False):
                     self._memory_objects[key] = storage_obj
                     storage_obj.decrease_pin_count()
-            self._notify_keys_stored(stored_keys)
+            # ``stored_keys`` and ``storage_objs`` are built together in the
+            # pre-alloc loop above, so the size lists stay aligned even
+            # when the pool ran out of slots mid-batch.
+            if stored_keys:
+                self._notify_keys_stored(stored_keys)
+            bytes_transferred = sum(obj.size for obj in storage_objs)
 
         # success is only set to false for transfer failures
         except Exception:
             logger.exception("NIXL store task %d failed", task_id)
             success = False
+            bytes_transferred = 0
 
             # free storage indices if transfer fails
             self.nixl_agent.pool.batched_free(storage_indices_flat)
 
         with self._lock:
             self._completed_store_tasks[task_id] = success
+            self._completed_store_task_bytes[task_id] = bytes_transferred
 
         self._signal_store_event()
 
