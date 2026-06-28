@@ -781,7 +781,6 @@ class LMCacheMPWorkerAdapter:
             kv_caches, kv_layout=layout_hints.get("kv_layout")
         )
 
-
         future = send_lmcache_request(
             self.mq_client,
             RequestType.REGISTER_KV_CACHE,
