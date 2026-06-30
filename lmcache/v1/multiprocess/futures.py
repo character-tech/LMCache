@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Standard
+import logging
 from typing import Generic, Optional, TypeVar
 import threading
 
 # Third Party
 import torch
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
@@ -95,15 +98,31 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         self.result_: T | None = None
         self.device_ = device if device is not None else torch.cuda.current_device()
 
-    def _on_raw_future_complete(self):
+    def _on_raw_future_complete(self) -> bool:
         """
         Update the CUDA event and result when the raw future is complete.
+
+        Returns:
+            bool: True if the event was successfully deserialized, False if the
+                originating GPU context is no longer valid (e.g. lmcache server
+                restarted or its HIP context was destroyed).
         """
         event_bytes, result = self.raw_future_.result()
         self.result_ = result
 
-        # Deserialize the CUDA event
-        self.event_ = torch.cuda.Event.from_ipc_handle(self.device_, event_bytes)
+        try:
+            self.event_ = torch.cuda.Event.from_ipc_handle(self.device_, event_bytes)
+        except (RuntimeError, torch.AcceleratorError):
+            # The IPC handle references a GPU context that no longer exists.
+            # Treat the future as permanently failed rather than crashing the
+            # vLLM worker with hipErrorInvalidContext.
+            logger.warning(
+                "Failed to deserialize CUDA IPC event handle — "
+                "lmcache GPU context may have been destroyed. "
+                "Marking future as failed."
+            )
+            return False
+        return True
 
     def wait(self, timeout: Optional[float] = None) -> bool:
         """
@@ -132,9 +151,11 @@ class CUDAMessagingFuture(MessagingFuture[T]):
         if not flag:
             return False
 
-        self._on_raw_future_complete()
+        if not self._on_raw_future_complete():
+            return False
 
-        assert self.event_ is not None
+        if self.event_ is None:
+            return False
         self.event_.synchronize()
 
         return True
@@ -175,8 +196,10 @@ class CUDAMessagingFuture(MessagingFuture[T]):
             return self.event_.query()
 
         if self.raw_future_.query():
-            self._on_raw_future_complete()
-            assert self.event_ is not None
+            if not self._on_raw_future_complete():
+                return False
+            if self.event_ is None:
+                return False
             return self.event_.query()
 
         return False

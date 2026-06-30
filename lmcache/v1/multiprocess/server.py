@@ -348,8 +348,7 @@ class MPCacheEngine:
                 )
             )
 
-            self._event_bus.publish_on_stream(
-                gpu_context.cupy_stream,
+            self._event_bus.publish(
                 Event(
                     event_type=EventType.MP_STORE_START,
                     session_id=key.request_id,
@@ -419,8 +418,7 @@ class MPCacheEngine:
                     if reserved_dict
                     else 0
                 )
-                self._event_bus.publish_on_stream(
-                    gpu_context.cupy_stream,
+                self._event_bus.publish(
                     Event(
                         event_type=EventType.MP_STORE_END,
                         session_id=key.request_id,
@@ -499,8 +497,7 @@ class MPCacheEngine:
             )
         )
 
-        self._event_bus.publish_on_stream(
-            gpu_context.cupy_stream,
+        self._event_bus.publish(
             Event(
                 event_type=EventType.MP_RETRIEVE_START,
                 session_id=key.request_id,
@@ -614,8 +611,7 @@ class MPCacheEngine:
                         "finish_read_prefetched",
                         prefetched_keys,
                     )
-                self._event_bus.publish_on_stream(
-                    gpu_context.cupy_stream,
+                self._event_bus.publish(
                     Event(
                         event_type=EventType.MP_RETRIEVE_END,
                         session_id=key.request_id,
