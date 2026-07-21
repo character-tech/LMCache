@@ -912,6 +912,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     # finish_write callback above have both actually run,
                     # instead of returning right after enqueuing them.
                     cache_context.stream.synchronize()
+                    logger.debug(
+                        "sync_mode: store() stream synchronized for "
+                        "request_id=%s",
+                        key.request_id,
+                    )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
@@ -1090,6 +1095,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     # actually run, instead of returning right after
                     # enqueuing them.
                     cache_context.stream.synchronize()
+                    logger.debug(
+                        "sync_mode: retrieve() stream synchronized for "
+                        "request_id=%s",
+                        key.request_id,
+                    )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
