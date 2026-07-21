@@ -420,10 +420,20 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     Args:
         ctx: The shared engine context.
+        sync_mode: When True, store()/retrieve() block on
+            cache_context.stream.synchronize() before returning, so the
+            GPU transfer and the finish_write/finish_read_prefetched
+            callback (stream-ordered after it) are guaranteed complete
+            before the caller sees a result. Diagnostic/mitigation flag
+            for a suspected async completion-signaling race; costs
+            throughput. Defaults to False (existing async behavior).
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(
+        self, ctx: MPCacheServerContext, sync_mode: bool = False
+    ) -> None:
         self._ctx = ctx
+        self._sync_mode = sync_mode
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
@@ -891,6 +901,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
                 else:
                     total_bytes = 0
+                if self._sync_mode:
+                    # Block until the D2H copy and the stream-ordered
+                    # finish_write callback above have both actually run,
+                    # instead of returning right after enqueuing them.
+                    cache_context.stream.synchronize()
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
@@ -1063,6 +1078,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         "finish_read_prefetched",
                         prefetched_keys,
                     )
+                if self._sync_mode:
+                    # Block until the H2D copy and the stream-ordered
+                    # finish_read_prefetched callback above have both
+                    # actually run, instead of returning right after
+                    # enqueuing them.
+                    cache_context.stream.synchronize()
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
