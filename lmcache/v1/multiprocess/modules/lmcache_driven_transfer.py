@@ -434,6 +434,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
     ) -> None:
         self._ctx = ctx
         self._sync_mode = sync_mode
+        if self._sync_mode:
+            logger.debug(
+                "LMCacheDrivenTransferModule starting with sync_mode=True: "
+                "store()/retrieve() will block on cache_context.stream."
+                "synchronize() before returning."
+            )
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
