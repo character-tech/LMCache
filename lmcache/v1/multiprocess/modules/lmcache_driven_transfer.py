@@ -908,13 +908,19 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 else:
                     total_bytes = 0
                 if self._sync_mode:
-                    # Block until the D2H copy and the stream-ordered
-                    # finish_write callback above have both actually run,
-                    # instead of returning right after enqueuing them.
+                    # Block until the D2H copy has actually completed.
                     cache_context.stream.synchronize()
+                    # synchronize() only guarantees the driver-thread callback
+                    # has recorded the completion into the native buffer, not
+                    # that the DeviceHostFuncDispatcher's poll thread has
+                    # drained it and run finish_write yet (that thread wakes
+                    # up to every 5ms on its own timer). Force a synchronous
+                    # drain here so the L1Manager lock is actually released
+                    # before this call returns.
+                    self._device_host_func_dispatcher.drain_now()
                     logger.debug(
-                        "sync_mode: store() stream synchronized for "
-                        "request_id=%s",
+                        "sync_mode: store() stream synchronized and drained "
+                        "for request_id=%s",
                         key.request_id,
                     )
                 self._ctx.event_bus.publish_on_stream(
@@ -1090,14 +1096,15 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         prefetched_keys,
                     )
                 if self._sync_mode:
-                    # Block until the H2D copy and the stream-ordered
-                    # finish_read_prefetched callback above have both
-                    # actually run, instead of returning right after
-                    # enqueuing them.
+                    # Block until the H2D copy has actually completed, then
+                    # force-drain the dispatcher (see the comment in store())
+                    # so finish_read_prefetched has actually run and released
+                    # the L1Manager lock before this call returns.
                     cache_context.stream.synchronize()
+                    self._device_host_func_dispatcher.drain_now()
                     logger.debug(
-                        "sync_mode: retrieve() stream synchronized for "
-                        "request_id=%s",
+                        "sync_mode: retrieve() stream synchronized and "
+                        "drained for request_id=%s",
                         key.request_id,
                     )
                 self._ctx.event_bus.publish_on_stream(
