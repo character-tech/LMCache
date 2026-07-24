@@ -6,7 +6,10 @@ Managing objects and memory for L1 cache
 # Standard
 from dataclasses import dataclass
 from typing import Literal
+import os
 import threading
+import time
+import zlib
 
 # First Party
 from lmcache.logging import init_logger
@@ -27,6 +30,15 @@ from lmcache.v1.mp_observability.otel_init import register_gauge
 
 logger = init_logger(__name__)
 
+# Debug-only instrumentation for the KV-cache stale-slot-reuse investigation:
+# hashes CPU-side KV bytes on every store/retrieve and logs a WARNING on a
+# retrieve-time mismatch. Off by default -- zero overhead unless enabled.
+LMCACHE_HASH_CHECK_DEBUG = os.getenv("LMCACHE_HASH_CHECK_DEBUG", "").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
 
 # Internal classes and helper functions
 @dataclass
@@ -46,6 +58,18 @@ class L1ObjectState:
 
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
+
+    content_hash: int | None = None
+    """ [LMCACHE_HASH_CHECK_DEBUG] CRC32 of the CPU KV bytes as of the last
+    finish_write, used to detect stale-slot-reuse corruption on retrieve. """
+
+    content_hash_data_ptr: int | None = None
+    """ [LMCACHE_HASH_CHECK_DEBUG] MemoryObj.data_ptr at the time
+    content_hash was computed. """
+
+    content_hash_store_time: float | None = None
+    """ [LMCACHE_HASH_CHECK_DEBUG] time.time() at the time content_hash
+    was computed. """
 
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
@@ -395,6 +419,37 @@ class L1Manager:
                 ret[key] = L1Error.KEY_IN_WRONG_STATE
                 continue
 
+            if LMCACHE_HASH_CHECK_DEBUG:
+                retrieve_time = time.time()
+                retrieve_hash = zlib.crc32(entry.memory_obj.byte_array)
+                retrieve_data_ptr = entry.memory_obj.data_ptr
+                if (
+                    entry.content_hash is not None
+                    and retrieve_hash != entry.content_hash
+                ):
+                    same_ptr = retrieve_data_ptr == entry.content_hash_data_ptr
+                    elapsed = (
+                        retrieve_time - entry.content_hash_store_time
+                        if entry.content_hash_store_time is not None
+                        else None
+                    )
+                    logger.warning(
+                        "L1Manager: HASH CHECK MISMATCH on retrieve for key "
+                        "%s: store_hash=%s retrieve_hash=%s "
+                        "store_time=%s retrieve_time=%s elapsed_s=%s "
+                        "store_data_ptr=%s retrieve_data_ptr=%s "
+                        "same_data_ptr=%s",
+                        key,
+                        entry.content_hash,
+                        retrieve_hash,
+                        entry.content_hash_store_time,
+                        retrieve_time,
+                        elapsed,
+                        entry.content_hash_data_ptr,
+                        retrieve_data_ptr,
+                        same_ptr,
+                    )
+
             # TODO(perf): support a count argument in
             # TTLLock.unlock() to avoid Python for-loop
             # overhead (TTLLock is C++ std::atomic).
@@ -570,6 +625,15 @@ class L1Manager:
                 )
                 ret[key] = L1Error.KEY_IN_WRONG_STATE
                 continue
+
+            if LMCACHE_HASH_CHECK_DEBUG:
+                # Always overwrite (never compare-then-overwrite): a
+                # same-key re-store (mode="all") reuses this L1ObjectState,
+                # so the stashed hash must reflect this store, not a
+                # comparison against its own prior generation.
+                entry.content_hash = zlib.crc32(entry.memory_obj.byte_array)
+                entry.content_hash_data_ptr = entry.memory_obj.data_ptr
+                entry.content_hash_store_time = time.time()
 
             entry.write_lock.unlock()
             ret[key] = L1Error.SUCCESS
