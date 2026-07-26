@@ -45,13 +45,27 @@ LMCACHE_HASH_CHECK_DEBUG = os.getenv("LMCACHE_HASH_CHECK_DEBUG", "").lower() in 
 @dataclass
 class _HashCheckJob:
     """[LMCACHE_HASH_CHECK_DEBUG] One store or retrieve event queued for
-    off-thread hashing. ``payload`` is an independent ``bytes`` copy (not a
-    reference into the live MemoryObj buffer), so hashing it can never race
-    a later write/free/reuse of the underlying L1 slot."""
+    off-thread hashing.
+
+    ``entry`` is the LIVE ``L1ObjectState`` -- not a copy of its bytes.
+    This is safe without copying because the caller (finish_write /
+    finish_read) deliberately does NOT release ``entry.write_lock`` /
+    ``entry.read_lock`` before handing the job off; the worker reads
+    ``entry.memory_obj.byte_array`` directly while that per-key lock is
+    still held, so the slot can't be reserved for a new write or evicted
+    out from under it, then releases the lock itself once hashing is
+    done. This avoids an ~18 MB memcpy under L1Manager's *global* lock
+    (which, unlike the per-key lock, blocks every other request's
+    reserve_write/reserve_read) -- see the finish_write/finish_read call
+    sites for exactly what's deferred and why.
+    """
 
     key: ObjectKey
+    entry: "L1ObjectState"
     is_store: bool
-    payload: bytes
+    # For retrieve jobs: how many read-lock counts to release (matches
+    # finish_read's own `total = 1 + extra_count`).
+    unlock_count: int
     data_ptr: int
     timestamp: float
 
@@ -59,13 +73,17 @@ class _HashCheckJob:
 class _HashCheckWorker:
     """[LMCACHE_HASH_CHECK_DEBUG] Off-thread CRC32 + compare-and-log.
 
-    finish_write/finish_read must stay fast under L1Manager's shared lock
-    (the same lock reserve_write/reserve_read/finish_* for every other
-    request also contend on) and off the single-threaded completion
-    dispatcher. This worker does the actual (comparatively expensive, tens
-    of MB per DeepSeek-V3 MLA object) zlib.crc32 + comparison + logging on
-    a dedicated thread, fed by a queue, so neither the lock nor the
-    dispatcher ever wait on it.
+    finish_write/finish_read must stay fast under L1Manager's shared
+    *global* lock (the same lock reserve_write/reserve_read/finish_* for
+    every other request also contend on) and off the single-threaded
+    completion dispatcher. This worker does the actual (comparatively
+    expensive, tens of MB per DeepSeek-V3 MLA object) zlib.crc32 +
+    comparison + logging on a dedicated thread, fed by a queue, reading
+    the live buffer directly (no copy) while the entry's own per-key
+    lock -- deliberately left held by the caller -- protects it from
+    reuse. The worker releases that per-key lock (and, for retrieves,
+    runs the same temporary-object cleanup finish_read would have run
+    inline) once it's done.
     """
 
     # Debug tool, not a correctness-critical cache: bound worst-case memory
@@ -75,7 +93,8 @@ class _HashCheckWorker:
     # skips the check for that retrieve, same as if hash-check were off.
     _MAX_TRACKED_KEYS = 1_000_000
 
-    def __init__(self) -> None:
+    def __init__(self, manager: "L1Manager") -> None:
+        self._manager = manager
         self._queue: "queue.Queue[_HashCheckJob | None]" = queue.Queue()
         # key -> (hash, data_ptr, store_time) for the most recent store.
         self._last_store: "OrderedDict[ObjectKey, tuple[int, int, float]]" = (
@@ -94,49 +113,62 @@ class _HashCheckWorker:
             job = self._queue.get()
             if job is None:
                 return
-            content_hash = zlib.crc32(job.payload)
-            if job.is_store:
-                self._last_store[job.key] = (
-                    content_hash,
-                    job.data_ptr,
-                    job.timestamp,
-                )
-                self._last_store.move_to_end(job.key)
-                if len(self._last_store) > self._MAX_TRACKED_KEYS:
-                    self._last_store.popitem(last=False)
-                continue
-
-            prior = self._last_store.get(job.key)
-            if prior is None:
-                continue
-            store_hash, store_data_ptr, store_time = prior
-            if content_hash != store_hash:
-                same_ptr = job.data_ptr == store_data_ptr
-                logger.warning(
-                    "L1Manager: HASH CHECK MISMATCH on retrieve for key "
-                    "%s: store_hash=%s retrieve_hash=%s "
-                    "store_time=%s retrieve_time=%s elapsed_s=%s "
-                    "store_data_ptr=%s retrieve_data_ptr=%s "
-                    "same_data_ptr=%s",
-                    job.key,
-                    store_hash,
-                    content_hash,
-                    store_time,
-                    job.timestamp,
-                    job.timestamp - store_time,
-                    store_data_ptr,
-                    job.data_ptr,
-                    same_ptr,
-                )
+            try:
+                # The per-key lock (write_lock for stores, read_lock for
+                # retrieves) is still held here -- deliberately not
+                # released by finish_write/finish_read -- so this read of
+                # the live buffer cannot race a reuse of the slot.
+                content_hash = zlib.crc32(job.entry.memory_obj.byte_array)
+                if job.is_store:
+                    self._last_store[job.key] = (
+                        content_hash,
+                        job.data_ptr,
+                        job.timestamp,
+                    )
+                    self._last_store.move_to_end(job.key)
+                    if len(self._last_store) > self._MAX_TRACKED_KEYS:
+                        self._last_store.popitem(last=False)
+                else:
+                    prior = self._last_store.get(job.key)
+                    if prior is not None:
+                        store_hash, store_data_ptr, store_time = prior
+                        if content_hash != store_hash:
+                            same_ptr = job.data_ptr == store_data_ptr
+                            logger.warning(
+                                "L1Manager: HASH CHECK MISMATCH on retrieve "
+                                "for key %s: store_hash=%s retrieve_hash=%s "
+                                "store_time=%s retrieve_time=%s "
+                                "elapsed_s=%s store_data_ptr=%s "
+                                "retrieve_data_ptr=%s same_data_ptr=%s",
+                                job.key,
+                                store_hash,
+                                content_hash,
+                                store_time,
+                                job.timestamp,
+                                job.timestamp - store_time,
+                                store_data_ptr,
+                                job.data_ptr,
+                                same_ptr,
+                            )
+            finally:
+                # Always release, even if hashing/logging raised, so a
+                # bug in this debug path can never leak a permanently
+                # held lock on a real L1 slot.
+                if job.is_store:
+                    self._manager._hash_check_finish_write_unlock(job.key)
+                else:
+                    self._manager._hash_check_finish_read_unlock(
+                        job.key, job.unlock_count
+                    )
 
 
 _hash_check_worker: "_HashCheckWorker | None" = None
 
 
-def _get_hash_check_worker() -> _HashCheckWorker:
+def _get_hash_check_worker(manager: "L1Manager") -> _HashCheckWorker:
     global _hash_check_worker
     if _hash_check_worker is None:
-        _hash_check_worker = _HashCheckWorker()
+        _hash_check_worker = _HashCheckWorker(manager)
     return _hash_check_worker
 
 
@@ -508,21 +540,29 @@ class L1Manager:
                 continue
 
             if LMCACHE_HASH_CHECK_DEBUG:
-                # Only a cheap bytes() copy happens under the lock; the
-                # actual crc32 + comparison + logging runs off-thread (see
-                # _HashCheckWorker) so this never contends with other
-                # requests' reserve_write/reserve_read on the same lock,
-                # and never blocks the single-threaded completion
-                # dispatcher that calls finish_read/finish_write.
-                _get_hash_check_worker().submit(
+                # Deliberately do NOT unlock read_lock here, and do NOT run
+                # the temporary-object cleanup below, for this key. Both
+                # are deferred to _HashCheckWorker: it reads
+                # entry.memory_obj.byte_array directly (no copy -- safe
+                # only because read_lock stays held until the worker
+                # itself releases it) off the global lock and off the
+                # single-threaded completion dispatcher, then calls
+                # _hash_check_finish_read_unlock to redo this exact
+                # unlock + cleanup + event-publish sequence under the
+                # global lock, once hashing is done.
+                _get_hash_check_worker(self).submit(
                     _HashCheckJob(
                         key=key,
+                        entry=entry,
                         is_store=False,
-                        payload=bytes(entry.memory_obj.byte_array),
+                        unlock_count=total,
                         data_ptr=entry.memory_obj.data_ptr,
                         timestamp=time.time(),
                     )
                 )
+                ret[key] = L1Error.SUCCESS
+                successful_keys.append(key)
+                continue
 
             # TODO(perf): support a count argument in
             # TTLLock.unlock() to avoid Python for-loop
@@ -557,6 +597,49 @@ class L1Manager:
         )
 
         return ret
+
+    @l1_mgr_synchronized
+    def _hash_check_finish_read_unlock(
+        self, key: "ObjectKey", unlock_count: int
+    ) -> None:
+        """[LMCACHE_HASH_CHECK_DEBUG] Completes the unlock + temporary-object
+        cleanup that ``finish_read`` deferred for ``key`` while
+        ``_HashCheckWorker`` hashed its buffer off-thread. Mirrors the
+        non-debug path in ``finish_read`` exactly, just re-entering the
+        global lock briefly to do it, instead of doing it inline."""
+        entry = self._objects.get(key, None)
+        if entry is None:
+            # Deleted by something else in the meantime (e.g. an
+            # explicit delete()) -- nothing left to unlock/clean up.
+            return
+
+        for _ in range(unlock_count):
+            entry.read_lock.unlock()
+
+        need_to_free: list[MemoryObj] = []
+        need_to_free_keys: list[ObjectKey] = []
+        if entry.is_temporary and not entry.read_lock.is_locked():
+            need_to_free.append(entry.memory_obj)
+            need_to_free_keys.append(key)
+            del self._objects[key]
+
+        self._memory_manager.free(need_to_free)
+
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_read_finished([key])
+            listener.on_l1_keys_deleted_by_manager(need_to_free_keys)
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_READ_FINISHED,
+                metadata={"keys": [key]},
+            )
+        )
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_KEYS_EVICTED,
+                metadata={"keys": need_to_free_keys},
+            )
+        )
 
     @l1_mgr_synchronized
     def reserve_write(
@@ -701,22 +784,29 @@ class L1Manager:
                 continue
 
             if LMCACHE_HASH_CHECK_DEBUG:
-                # Always overwrite (never compare-then-overwrite): a
-                # same-key re-store (mode="all") reuses this key's prior
-                # entry in the worker's _last_store map, so the queued
-                # store job must reflect this store, not a comparison
-                # against its own prior generation. Only a cheap bytes()
-                # copy happens under the lock; see the finish_read hook
-                # above for why the actual hashing is deferred off-thread.
-                _get_hash_check_worker().submit(
+                # Deliberately do NOT unlock write_lock here -- deferred to
+                # _HashCheckWorker, which reads entry.memory_obj.byte_array
+                # directly (no copy -- safe only because write_lock stays
+                # held until the worker itself releases it) off the global
+                # lock and off the single-threaded completion dispatcher,
+                # then calls _hash_check_finish_write_unlock once hashing
+                # is done. Same-key re-store (mode="all") naturally
+                # overwrites this key's entry in the worker's _last_store
+                # map, so a queued store job always reflects this store,
+                # never a comparison against its own prior generation.
+                _get_hash_check_worker(self).submit(
                     _HashCheckJob(
                         key=key,
+                        entry=entry,
                         is_store=True,
-                        payload=bytes(entry.memory_obj.byte_array),
+                        unlock_count=0,
                         data_ptr=entry.memory_obj.data_ptr,
                         timestamp=time.time(),
                     )
                 )
+                ret[key] = L1Error.SUCCESS
+                successful_keys.append(key)
+                continue
 
             entry.write_lock.unlock()
             ret[key] = L1Error.SUCCESS
@@ -731,6 +821,21 @@ class L1Manager:
             )
         )
         return ret
+
+    @l1_mgr_synchronized
+    def _hash_check_finish_write_unlock(self, key: "ObjectKey") -> None:
+        """[LMCACHE_HASH_CHECK_DEBUG] Releases the write lock that
+        ``finish_write`` deferred for ``key`` while ``_HashCheckWorker``
+        hashed its buffer off-thread. ``finish_write`` already published
+        the write-finished event and returned SUCCESS for this key
+        synchronously (matching its existing fire-and-forget semantics in
+        async mode); only the lock release itself was deferred."""
+        entry = self._objects.get(key, None)
+        if entry is None:
+            # Deleted by something else in the meantime -- nothing left
+            # to unlock.
+            return
+        entry.write_lock.unlock()
 
     @l1_mgr_synchronized
     def finish_write_and_reserve_read(
