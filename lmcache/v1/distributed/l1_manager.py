@@ -4,9 +4,11 @@ Managing objects and memory for L1 cache
 """
 
 # Standard
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Literal
 import os
+import queue
 import threading
 import time
 import zlib
@@ -40,6 +42,104 @@ LMCACHE_HASH_CHECK_DEBUG = os.getenv("LMCACHE_HASH_CHECK_DEBUG", "").lower() in 
 )
 
 
+@dataclass
+class _HashCheckJob:
+    """[LMCACHE_HASH_CHECK_DEBUG] One store or retrieve event queued for
+    off-thread hashing. ``payload`` is an independent ``bytes`` copy (not a
+    reference into the live MemoryObj buffer), so hashing it can never race
+    a later write/free/reuse of the underlying L1 slot."""
+
+    key: ObjectKey
+    is_store: bool
+    payload: bytes
+    data_ptr: int
+    timestamp: float
+
+
+class _HashCheckWorker:
+    """[LMCACHE_HASH_CHECK_DEBUG] Off-thread CRC32 + compare-and-log.
+
+    finish_write/finish_read must stay fast under L1Manager's shared lock
+    (the same lock reserve_write/reserve_read/finish_* for every other
+    request also contend on) and off the single-threaded completion
+    dispatcher. This worker does the actual (comparatively expensive, tens
+    of MB per DeepSeek-V3 MLA object) zlib.crc32 + comparison + logging on
+    a dedicated thread, fed by a queue, so neither the lock nor the
+    dispatcher ever wait on it.
+    """
+
+    # Debug tool, not a correctness-critical cache: bound worst-case memory
+    # (~500 bytes/entry -> ~500 MB at this cap) rather than growing forever
+    # over a multi-hour run. FIFO eviction means a key stored long enough
+    # ago to fall out of the window before its next retrieve just silently
+    # skips the check for that retrieve, same as if hash-check were off.
+    _MAX_TRACKED_KEYS = 1_000_000
+
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[_HashCheckJob | None]" = queue.Queue()
+        # key -> (hash, data_ptr, store_time) for the most recent store.
+        self._last_store: "OrderedDict[ObjectKey, tuple[int, int, float]]" = (
+            OrderedDict()
+        )
+        self._thread = threading.Thread(
+            target=self._run, name="lmcache-hash-check-debug", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, job: _HashCheckJob) -> None:
+        self._queue.put(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            if job is None:
+                return
+            content_hash = zlib.crc32(job.payload)
+            if job.is_store:
+                self._last_store[job.key] = (
+                    content_hash,
+                    job.data_ptr,
+                    job.timestamp,
+                )
+                self._last_store.move_to_end(job.key)
+                if len(self._last_store) > self._MAX_TRACKED_KEYS:
+                    self._last_store.popitem(last=False)
+                continue
+
+            prior = self._last_store.get(job.key)
+            if prior is None:
+                continue
+            store_hash, store_data_ptr, store_time = prior
+            if content_hash != store_hash:
+                same_ptr = job.data_ptr == store_data_ptr
+                logger.warning(
+                    "L1Manager: HASH CHECK MISMATCH on retrieve for key "
+                    "%s: store_hash=%s retrieve_hash=%s "
+                    "store_time=%s retrieve_time=%s elapsed_s=%s "
+                    "store_data_ptr=%s retrieve_data_ptr=%s "
+                    "same_data_ptr=%s",
+                    job.key,
+                    store_hash,
+                    content_hash,
+                    store_time,
+                    job.timestamp,
+                    job.timestamp - store_time,
+                    store_data_ptr,
+                    job.data_ptr,
+                    same_ptr,
+                )
+
+
+_hash_check_worker: "_HashCheckWorker | None" = None
+
+
+def _get_hash_check_worker() -> _HashCheckWorker:
+    global _hash_check_worker
+    if _hash_check_worker is None:
+        _hash_check_worker = _HashCheckWorker()
+    return _hash_check_worker
+
+
 # Internal classes and helper functions
 @dataclass
 class L1ObjectState:
@@ -58,18 +158,6 @@ class L1ObjectState:
 
     is_temporary: bool
     """ Whether the object is temporary (need to be deleted after read). """
-
-    content_hash: int | None = None
-    """ [LMCACHE_HASH_CHECK_DEBUG] CRC32 of the CPU KV bytes as of the last
-    finish_write, used to detect stale-slot-reuse corruption on retrieve. """
-
-    content_hash_data_ptr: int | None = None
-    """ [LMCACHE_HASH_CHECK_DEBUG] MemoryObj.data_ptr at the time
-    content_hash was computed. """
-
-    content_hash_store_time: float | None = None
-    """ [LMCACHE_HASH_CHECK_DEBUG] time.time() at the time content_hash
-    was computed. """
 
     def available_for_read(self) -> bool:
         """Check if the object is available for read.
@@ -420,35 +508,21 @@ class L1Manager:
                 continue
 
             if LMCACHE_HASH_CHECK_DEBUG:
-                retrieve_time = time.time()
-                retrieve_hash = zlib.crc32(entry.memory_obj.byte_array)
-                retrieve_data_ptr = entry.memory_obj.data_ptr
-                if (
-                    entry.content_hash is not None
-                    and retrieve_hash != entry.content_hash
-                ):
-                    same_ptr = retrieve_data_ptr == entry.content_hash_data_ptr
-                    elapsed = (
-                        retrieve_time - entry.content_hash_store_time
-                        if entry.content_hash_store_time is not None
-                        else None
+                # Only a cheap bytes() copy happens under the lock; the
+                # actual crc32 + comparison + logging runs off-thread (see
+                # _HashCheckWorker) so this never contends with other
+                # requests' reserve_write/reserve_read on the same lock,
+                # and never blocks the single-threaded completion
+                # dispatcher that calls finish_read/finish_write.
+                _get_hash_check_worker().submit(
+                    _HashCheckJob(
+                        key=key,
+                        is_store=False,
+                        payload=bytes(entry.memory_obj.byte_array),
+                        data_ptr=entry.memory_obj.data_ptr,
+                        timestamp=time.time(),
                     )
-                    logger.warning(
-                        "L1Manager: HASH CHECK MISMATCH on retrieve for key "
-                        "%s: store_hash=%s retrieve_hash=%s "
-                        "store_time=%s retrieve_time=%s elapsed_s=%s "
-                        "store_data_ptr=%s retrieve_data_ptr=%s "
-                        "same_data_ptr=%s",
-                        key,
-                        entry.content_hash,
-                        retrieve_hash,
-                        entry.content_hash_store_time,
-                        retrieve_time,
-                        elapsed,
-                        entry.content_hash_data_ptr,
-                        retrieve_data_ptr,
-                        same_ptr,
-                    )
+                )
 
             # TODO(perf): support a count argument in
             # TTLLock.unlock() to avoid Python for-loop
@@ -628,12 +702,21 @@ class L1Manager:
 
             if LMCACHE_HASH_CHECK_DEBUG:
                 # Always overwrite (never compare-then-overwrite): a
-                # same-key re-store (mode="all") reuses this L1ObjectState,
-                # so the stashed hash must reflect this store, not a
-                # comparison against its own prior generation.
-                entry.content_hash = zlib.crc32(entry.memory_obj.byte_array)
-                entry.content_hash_data_ptr = entry.memory_obj.data_ptr
-                entry.content_hash_store_time = time.time()
+                # same-key re-store (mode="all") reuses this key's prior
+                # entry in the worker's _last_store map, so the queued
+                # store job must reflect this store, not a comparison
+                # against its own prior generation. Only a cheap bytes()
+                # copy happens under the lock; see the finish_read hook
+                # above for why the actual hashing is deferred off-thread.
+                _get_hash_check_worker().submit(
+                    _HashCheckJob(
+                        key=key,
+                        is_store=True,
+                        payload=bytes(entry.memory_obj.byte_array),
+                        data_ptr=entry.memory_obj.data_ptr,
+                        timestamp=time.time(),
+                    )
+                )
 
             entry.write_lock.unlock()
             ret[key] = L1Error.SUCCESS
