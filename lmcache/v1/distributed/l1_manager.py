@@ -85,9 +85,16 @@ class _HashCheckShard:
     # tracked-key capacity doesn't grow with shard count.
     _MAX_TRACKED_KEYS_TOTAL = 1_000_000
 
+    # How often (in processed jobs) to log a queue-wait summary for this
+    # shard. Purely observational -- lets us see, from a completed run's
+    # log, whether the worker ever came close to the TTL boundary even on
+    # runs (like a clean one) where the skip guard never had to fire.
+    _WAIT_LOG_INTERVAL = 2000
+
     def __init__(self, manager: "L1Manager", max_tracked_keys: int, index: int) -> None:
         self._manager = manager
         self._max_tracked_keys = max_tracked_keys
+        self._index = index
         self._queue: "queue.Queue[_HashCheckJob | None]" = queue.Queue()
         # key -> (hash, data_ptr, store_time) for the most recent store.
         # Private to this shard -- never touched by any other thread, so
@@ -95,6 +102,8 @@ class _HashCheckShard:
         self._last_store: "OrderedDict[ObjectKey, tuple[int, int, float]]" = (
             OrderedDict()
         )
+        self._jobs_processed = 0
+        self._max_wait_since_last_log = 0.0
         self._thread = threading.Thread(
             target=self._run,
             name=f"lmcache-hash-check-debug-{index}",
@@ -110,6 +119,21 @@ class _HashCheckShard:
             job = self._queue.get()
             if job is None:
                 return
+            wait_s = time.time() - job.timestamp
+            if wait_s > self._max_wait_since_last_log:
+                self._max_wait_since_last_log = wait_s
+            self._jobs_processed += 1
+            if self._jobs_processed % self._WAIT_LOG_INTERVAL == 0:
+                logger.info(
+                    "L1Manager: hash-check shard %d queue-wait summary: "
+                    "jobs_processed=%d max_wait_s_this_window=%.3f "
+                    "queue_depth_now=%d",
+                    self._index,
+                    self._jobs_processed,
+                    self._max_wait_since_last_log,
+                    self._queue.qsize(),
+                )
+                self._max_wait_since_last_log = 0.0
             try:
                 # The per-key lock (write_lock for stores, read_lock for
                 # retrieves) is still held here -- deliberately not
