@@ -70,38 +70,35 @@ class _HashCheckJob:
     timestamp: float
 
 
-class _HashCheckWorker:
-    """[LMCACHE_HASH_CHECK_DEBUG] Off-thread CRC32 + compare-and-log.
-
-    finish_write/finish_read must stay fast under L1Manager's shared
-    *global* lock (the same lock reserve_write/reserve_read/finish_* for
-    every other request also contend on) and off the single-threaded
-    completion dispatcher. This worker does the actual (comparatively
-    expensive, tens of MB per DeepSeek-V3 MLA object) zlib.crc32 +
-    comparison + logging on a dedicated thread, fed by a queue, reading
-    the live buffer directly (no copy) while the entry's own per-key
-    lock -- deliberately left held by the caller -- protects it from
-    reuse. The worker releases that per-key lock (and, for retrieves,
-    runs the same temporary-object cleanup finish_read would have run
-    inline) once it's done.
-    """
+class _HashCheckShard:
+    """[LMCACHE_HASH_CHECK_DEBUG] One shard of the hash-check worker: one
+    queue, one dedicated thread, one private ``_last_store`` table. See
+    ``_HashCheckWorker`` for why sharding-by-key (rather than N threads
+    pulling off one shared queue) is required for correctness here."""
 
     # Debug tool, not a correctness-critical cache: bound worst-case memory
-    # (~500 bytes/entry -> ~500 MB at this cap) rather than growing forever
-    # over a multi-hour run. FIFO eviction means a key stored long enough
-    # ago to fall out of the window before its next retrieve just silently
-    # skips the check for that retrieve, same as if hash-check were off.
-    _MAX_TRACKED_KEYS = 1_000_000
+    # (~500 bytes/entry -> ~500 MB total across all shards at this cap)
+    # rather than growing forever over a multi-hour run. FIFO eviction
+    # means a key stored long enough ago to fall out of the window before
+    # its next retrieve just silently skips the check for that retrieve,
+    # same as if hash-check were off. Divided across shards so total
+    # tracked-key capacity doesn't grow with shard count.
+    _MAX_TRACKED_KEYS_TOTAL = 1_000_000
 
-    def __init__(self, manager: "L1Manager") -> None:
+    def __init__(self, manager: "L1Manager", max_tracked_keys: int, index: int) -> None:
         self._manager = manager
+        self._max_tracked_keys = max_tracked_keys
         self._queue: "queue.Queue[_HashCheckJob | None]" = queue.Queue()
         # key -> (hash, data_ptr, store_time) for the most recent store.
+        # Private to this shard -- never touched by any other thread, so
+        # no lock is needed around it.
         self._last_store: "OrderedDict[ObjectKey, tuple[int, int, float]]" = (
             OrderedDict()
         )
         self._thread = threading.Thread(
-            target=self._run, name="lmcache-hash-check-debug", daemon=True
+            target=self._run,
+            name=f"lmcache-hash-check-debug-{index}",
+            daemon=True,
         )
         self._thread.start()
 
@@ -152,7 +149,7 @@ class _HashCheckWorker:
                         job.timestamp,
                     )
                     self._last_store.move_to_end(job.key)
-                    if len(self._last_store) > self._MAX_TRACKED_KEYS:
+                    if len(self._last_store) > self._max_tracked_keys:
                         self._last_store.popitem(last=False)
                 else:
                     prior = self._last_store.get(job.key)
@@ -188,13 +185,66 @@ class _HashCheckWorker:
                     )
 
 
+class _HashCheckWorker:
+    """[LMCACHE_HASH_CHECK_DEBUG] Off-thread CRC32 + compare-and-log,
+    sharded across ``num_shards`` independent threads.
+
+    finish_write/finish_read must stay fast under L1Manager's shared
+    *global* lock (the same lock reserve_write/reserve_read/finish_* for
+    every other request also contend on) and off the single-threaded
+    completion dispatcher. This worker does the actual (comparatively
+    expensive, tens of MB per DeepSeek-V3 MLA object) zlib.crc32 +
+    comparison + logging on background threads, reading the live buffer
+    directly (no copy) while the entry's own per-key lock -- deliberately
+    left held by the caller -- protects it from reuse. Each shard
+    releases that per-key lock (and, for retrieves, runs the same
+    temporary-object cleanup finish_read would have run inline) once
+    it's done with a given job.
+
+    Sharded by key, not a shared queue drained by N threads: a key's
+    store must always be hashed before that same key's later retrieve,
+    and each shard keeps its own private ``_last_store`` table with no
+    cross-thread locking. Routing every job for a given key to the same
+    shard (via a stable hash of the key) preserves that ordering for
+    free and lets ``_last_store`` stay lock-free, at the cost of no
+    ordering guarantee *across* different keys -- which finish_write/
+    finish_read never needed anyway.
+    """
+
+    def __init__(self, manager: "L1Manager", num_shards: int) -> None:
+        if num_shards < 1:
+            raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+        max_tracked_keys = max(
+            1, _HashCheckShard._MAX_TRACKED_KEYS_TOTAL // num_shards
+        )
+        self._shards = [
+            _HashCheckShard(manager, max_tracked_keys, i) for i in range(num_shards)
+        ]
+
+    def submit(self, job: _HashCheckJob) -> None:
+        shard = self._shards[hash(job.key) % len(self._shards)]
+        shard.submit(job)
+
+
 _hash_check_worker: "_HashCheckWorker | None" = None
+
+# Number of shards (queue + thread + private _last_store table) the hash
+# check worker splits across. A single shard's one thread can become a
+# bottleneck under real traffic (5 QPS x many KV chunks/request, each
+# ~1ms of zlib.crc32 on an ~18MB DeepSeek-V3 MLA object): a backed-up
+# queue delays a job past the L1Manager write/read lock's own TTL
+# (600s/300s), letting the slot be legitimately reused before this debug
+# patch gets to it -- see _HASH_CHECK_SKIPPED handling below. More
+# shards = more parallel drain throughput = less queueing delay.
+LMCACHE_HASH_CHECK_NUM_SHARDS = max(
+    1, int(os.getenv("LMCACHE_HASH_CHECK_NUM_SHARDS", "8"))
+)
 
 
 def _get_hash_check_worker(manager: "L1Manager") -> _HashCheckWorker:
     global _hash_check_worker
     if _hash_check_worker is None:
-        _hash_check_worker = _HashCheckWorker(manager)
+        _hash_check_worker = _HashCheckWorker(manager, LMCACHE_HASH_CHECK_NUM_SHARDS)
     return _hash_check_worker
 
 
