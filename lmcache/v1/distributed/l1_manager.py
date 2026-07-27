@@ -117,7 +117,33 @@ class _HashCheckWorker:
                 # The per-key lock (write_lock for stores, read_lock for
                 # retrieves) is still held here -- deliberately not
                 # released by finish_write/finish_read -- so this read of
-                # the live buffer cannot race a reuse of the slot.
+                # the live buffer cannot race a reuse of the slot, UNLESS
+                # the lock's own TTL (write_ttl_seconds / read_ttl_seconds,
+                # e.g. 600s/300s) expired while this job was sitting in the
+                # queue: TTLLock silently drops to "unlocked" on TTL expiry
+                # regardless of our still-outstanding logical hold, letting
+                # a different request's reserve_write reuse or reallocate
+                # this exact slot before we get to hash it. That would make
+                # us hash bytes a concurrent, unrelated request now owns --
+                # a false mismatch caused by this debug patch itself, not
+                # by the real stale-slot-reuse bug under investigation. A
+                # changed data_ptr is the reliable tell (the allocator
+                # handed the key a new MemoryObj); this check is a coarse
+                # backstop only -- if reuse happened in-place on the very
+                # same allocation (rare, but possible) the pointer alone
+                # can't catch it.
+                if job.entry.memory_obj.data_ptr != job.data_ptr:
+                    logger.warning(
+                        "L1Manager: HASH CHECK SKIPPED (lock TTL likely "
+                        "expired mid-queue) for key %s: queued_data_ptr=%s "
+                        "current_data_ptr=%s is_store=%s queue_wait_s=%s",
+                        job.key,
+                        job.data_ptr,
+                        job.entry.memory_obj.data_ptr,
+                        job.is_store,
+                        time.time() - job.timestamp,
+                    )
+                    continue
                 content_hash = zlib.crc32(job.entry.memory_obj.byte_array)
                 if job.is_store:
                     self._last_store[job.key] = (
