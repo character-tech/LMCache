@@ -47,17 +47,10 @@ class _HashCheckJob:
     """[LMCACHE_HASH_CHECK_DEBUG] One store or retrieve event queued for
     off-thread hashing.
 
-    ``entry`` is the LIVE ``L1ObjectState`` -- not a copy of its bytes.
-    This is safe without copying because the caller (finish_write /
-    finish_read) deliberately does NOT release ``entry.write_lock`` /
-    ``entry.read_lock`` before handing the job off; the worker reads
-    ``entry.memory_obj.byte_array`` directly while that per-key lock is
-    still held, so the slot can't be reserved for a new write or evicted
-    out from under it, then releases the lock itself once hashing is
-    done. This avoids an ~18 MB memcpy under L1Manager's *global* lock
-    (which, unlike the per-key lock, blocks every other request's
-    reserve_write/reserve_read) -- see the finish_write/finish_read call
-    sites for exactly what's deferred and why.
+    ``entry`` is the LIVE ``L1ObjectState``, not a copy -- safe because
+    the caller keeps its write_lock/read_lock held until the worker
+    releases it, so the slot can't be reused while queued. Avoids an
+    ~18 MB memcpy under L1Manager's global lock.
     """
 
     key: ObjectKey
@@ -73,39 +66,22 @@ class _HashCheckJob:
 class _HashCheckWorker:
     """[LMCACHE_HASH_CHECK_DEBUG] Off-thread CRC32 + compare-and-log.
 
-    finish_write/finish_read must stay fast under L1Manager's shared
-    *global* lock (the same lock reserve_write/reserve_read/finish_* for
-    every other request also contend on) and off the single-threaded
-    completion dispatcher. This worker does the actual (comparatively
-    expensive, tens of MB per DeepSeek-V3 MLA object) zlib.crc32 +
-    comparison + logging on a dedicated thread, fed by a queue, reading
-    the live buffer directly (no copy) while the entry's own per-key
-    lock -- deliberately left held by the caller -- protects it from
-    reuse. The worker releases that per-key lock (and, for retrieves,
-    runs the same temporary-object cleanup finish_read would have run
-    inline) once it's done.
-
-    Deliberately single-threaded, not sharded across multiple threads: a
-    sharded version was tried and reverted (2026-07-27) to rule out any
-    possibility that sharding itself -- not just the TTL-expiry fix --
-    changed what this patch is able to catch, since the original,
-    single-threaded design is the one that caught the real, confirmed
-    HASH CHECK MISMATCH events this investigation is built on. Queue
-    backlog under real traffic is handled by the TTL-expiry SKIPPED
-    guard below plus the queue-wait telemetry, not by adding threads.
+    Keeps the expensive crc32/comparison work off L1Manager's global
+    lock and single-threaded completion dispatcher. Single-threaded by
+    design (a sharded version was tried and reverted) to keep results
+    comparable to the original design that caught the confirmed
+    mismatches this investigation is built on; queue backlog is handled
+    via the TTL-expiry skip below plus queue-wait telemetry, not threads.
     """
 
-    # Debug tool, not a correctness-critical cache: bound worst-case memory
-    # (~500 bytes/entry -> ~500 MB at this cap) rather than growing forever
-    # over a multi-hour run. FIFO eviction means a key stored long enough
-    # ago to fall out of the window before its next retrieve just silently
-    # skips the check for that retrieve, same as if hash-check were off.
+    # Bounds worst-case memory (~500 bytes/entry) instead of growing
+    # unboundedly over a multi-hour run. FIFO eviction just silently
+    # skips the check for a key that ages out before its next retrieve.
     _MAX_TRACKED_KEYS = 1_000_000
 
-    # How often (in processed jobs) to log a queue-wait summary. Purely
-    # observational -- lets us see, from a completed run's log, whether
-    # the worker ever came close to the TTL boundary even on runs (like a
-    # clean one) where the TTL-expiry skip never had to fire.
+    # How often (in processed jobs) to log a queue-wait summary -- lets
+    # us see from a run's log whether the worker ever neared the TTL
+    # boundary, even on a clean run where the skip guard never fires.
     _WAIT_LOG_INTERVAL = 2000
 
     def __init__(self, manager: "L1Manager") -> None:
@@ -145,37 +121,16 @@ class _HashCheckWorker:
                 )
                 self._max_wait_since_last_log = 0.0
             try:
-                # The per-key lock (write_lock for stores, read_lock for
-                # retrieves) is still held here -- deliberately not
-                # released by finish_write/finish_read -- so this read of
-                # the live buffer cannot race a reuse of the slot, UNLESS
-                # the lock's own TTL (write_ttl_seconds / read_ttl_seconds,
-                # e.g. 600s/300s) expired while this job was sitting in the
-                # queue: TTLLock silently drops to "unlocked" on TTL expiry
-                # regardless of our still-outstanding logical hold, letting
-                # a different request's reserve_write reuse or reallocate
-                # this exact slot before we get to hash it. That would make
-                # us hash bytes a concurrent, unrelated request now owns --
-                # a TTL-expiry false positive caused by this debug patch
-                # itself, not by the real stale-slot-reuse bug under
-                # investigation. A changed data_ptr is the reliable tell
-                # (the allocator handed the key a new MemoryObj); this
-                # check is a coarse backstop only -- if reuse happened
-                # in-place on the very same allocation (rare, but
-                # possible, since L1's allocator is an explicit free-list
-                # allocator over a fixed pinned buffer and commonly hands
-                # the exact freed address back out to the next
-                # same-size allocation) the pointer alone can't catch it.
-                # KNOWN RESIDUAL RISK (accepted, not fixed): closing this
-                # fully would require re-checking entry identity
-                # (self._objects.get(key) is job.entry) under the global
-                # lock before hashing, which reintroduces per-job lock
-                # contention this off-thread design exists to avoid, on
-                # every job rather than only the rare contaminated ones.
-                # Revisit if a future run's mismatches don't cleanly
-                # separate from this profile (e.g. same_data_ptr=True
-                # mismatches at elapsed_s just above what the queue-wait
-                # telemetry shows was the worst-case wait in that run).
+                # The per-key lock stays held while queued, but its TTL
+                # (600s write / 300s read) expires on its own timer
+                # regardless -- if this job waited that long, the slot
+                # may have been legitimately reused, and hashing it would
+                # be a false positive from this debug patch, not the real
+                # bug. Detected via data_ptr change (coarse: an in-place
+                # reuse at the same address, possible since L1 uses a
+                # free-list allocator, would slip through -- accepted
+                # residual risk, not worth a lock round-trip per job to
+                # close).
                 if job.entry.memory_obj.data_ptr != job.data_ptr:
                     logger.warning(
                         "L1Manager: HASH CHECK TTL EXPIRY (not a real "
@@ -613,16 +568,9 @@ class L1Manager:
                 continue
 
             if LMCACHE_HASH_CHECK_DEBUG:
-                # Deliberately do NOT unlock read_lock here, and do NOT run
-                # the temporary-object cleanup below, for this key. Both
-                # are deferred to _HashCheckWorker: it reads
-                # entry.memory_obj.byte_array directly (no copy -- safe
-                # only because read_lock stays held until the worker
-                # itself releases it) off the global lock and off the
-                # single-threaded completion dispatcher, then calls
-                # _hash_check_finish_read_unlock to redo this exact
-                # unlock + cleanup + event-publish sequence under the
-                # global lock, once hashing is done.
+                # Defer the unlock + temp-object cleanup to
+                # _hash_check_finish_read_unlock, called once
+                # _HashCheckWorker finishes hashing off-thread.
                 _get_hash_check_worker(self).submit(
                     _HashCheckJob(
                         key=key,
@@ -675,11 +623,9 @@ class L1Manager:
     def _hash_check_finish_read_unlock(
         self, key: "ObjectKey", unlock_count: int
     ) -> None:
-        """[LMCACHE_HASH_CHECK_DEBUG] Completes the unlock + temporary-object
-        cleanup that ``finish_read`` deferred for ``key`` while
-        ``_HashCheckWorker`` hashed its buffer off-thread. Mirrors the
-        non-debug path in ``finish_read`` exactly, just re-entering the
-        global lock briefly to do it, instead of doing it inline."""
+        """[LMCACHE_HASH_CHECK_DEBUG] Completes the unlock + cleanup
+        finish_read deferred for ``key`` while the worker hashed its
+        buffer. Mirrors the non-debug path exactly."""
         entry = self._objects.get(key, None)
         if entry is None:
             # Deleted by something else in the meantime (e.g. an
@@ -857,16 +803,10 @@ class L1Manager:
                 continue
 
             if LMCACHE_HASH_CHECK_DEBUG:
-                # Deliberately do NOT unlock write_lock here -- deferred to
-                # _HashCheckWorker, which reads entry.memory_obj.byte_array
-                # directly (no copy -- safe only because write_lock stays
-                # held until the worker itself releases it) off the global
-                # lock and off the single-threaded completion dispatcher,
-                # then calls _hash_check_finish_write_unlock once hashing
-                # is done. Same-key re-store (mode="all") naturally
-                # overwrites this key's entry in the worker's _last_store
-                # map, so a queued store job always reflects this store,
-                # never a comparison against its own prior generation.
+                # Defer the unlock to _hash_check_finish_write_unlock,
+                # called once the worker finishes hashing off-thread.
+                # A same-key re-store just overwrites _last_store, so a
+                # queued job never compares against a stale generation.
                 _get_hash_check_worker(self).submit(
                     _HashCheckJob(
                         key=key,
@@ -897,12 +837,10 @@ class L1Manager:
 
     @l1_mgr_synchronized
     def _hash_check_finish_write_unlock(self, key: "ObjectKey") -> None:
-        """[LMCACHE_HASH_CHECK_DEBUG] Releases the write lock that
-        ``finish_write`` deferred for ``key`` while ``_HashCheckWorker``
-        hashed its buffer off-thread. ``finish_write`` already published
-        the write-finished event and returned SUCCESS for this key
-        synchronously (matching its existing fire-and-forget semantics in
-        async mode); only the lock release itself was deferred."""
+        """[LMCACHE_HASH_CHECK_DEBUG] Releases the write lock finish_write
+        deferred for ``key`` while the worker hashed its buffer. Event
+        publishing already happened synchronously in finish_write; only
+        the lock release itself was deferred."""
         entry = self._objects.get(key, None)
         if entry is None:
             # Deleted by something else in the meantime -- nothing left
