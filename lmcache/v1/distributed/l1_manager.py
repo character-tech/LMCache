@@ -153,6 +153,28 @@ class _HashCheckShard:
                 # backstop only -- if reuse happened in-place on the very
                 # same allocation (rare, but possible) the pointer alone
                 # can't catch it.
+                # KNOWN RESIDUAL RISK (accepted, not fixed): this check is
+                # lock-free by design -- adding a second global-lock
+                # round-trip here (re-checking self._objects.get(key) is
+                # job.entry, the airtight version) would reintroduce the
+                # per-job lock contention this sharded-worker redesign
+                # exists to avoid, on every single job rather than only
+                # the rare contaminated ones. The gap: L1's allocator
+                # (TensorMemoryAllocator/AddressManager, an explicit
+                # free-list allocator over a fixed pinned buffer) can and
+                # does hand the exact freed address back out to the very
+                # next allocation of matching size. If a DIFFERENT key's
+                # write reuses this job's freed slot at the SAME address
+                # within the queue-wait window, this check sees an
+                # unchanged data_ptr and proceeds to hash -- a TTL-expiry
+                # false positive that slips past this guard undetected.
+                # Believed narrow (needs same-size same-address reuse
+                # within a single job's queue wait, not just any reuse
+                # anywhere) but not proven negligible; revisit if a future
+                # run's mismatches don't cleanly separate from this
+                # profile (e.g. same_data_ptr=True mismatches at
+                # elapsed_s just above what queue-wait telemetry shows was
+                # the worst-case wait in that run).
                 if job.entry.memory_obj.data_ptr != job.data_ptr:
                     logger.warning(
                         "L1Manager: HASH CHECK SKIPPED (lock TTL likely "
