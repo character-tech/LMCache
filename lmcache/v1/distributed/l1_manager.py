@@ -63,38 +63,42 @@ class _HashCheckJob:
     timestamp: float
 
 
-class _HashCheckWorker:
-    """[LMCACHE_HASH_CHECK_DEBUG] Off-thread CRC32 + compare-and-log.
+class _HashCheckShard:
+    """[LMCACHE_HASH_CHECK_DEBUG] One shard of the hash-check worker: one
+    queue, one dedicated thread, one private ``_last_store`` table.
 
-    Keeps the expensive crc32/comparison work off L1Manager's global
-    lock and single-threaded completion dispatcher. Single-threaded by
-    design (a sharded version was tried and reverted) to keep results
-    comparable to the original design that caught the confirmed
-    mismatches this investigation is built on; queue backlog is handled
-    via the TTL-expiry skip below plus queue-wait telemetry, not threads.
+    Sharded by key (not a shared queue drained by N threads) so a key's
+    store always hashes before that key's later retrieve, and each
+    shard's ``_last_store`` needs no cross-thread locking.
     """
 
-    # Bounds worst-case memory (~500 bytes/entry) instead of growing
-    # unboundedly over a multi-hour run. FIFO eviction just silently
-    # skips the check for a key that ages out before its next retrieve.
-    _MAX_TRACKED_KEYS = 1_000_000
+    # Bounds worst-case memory (~500 bytes/entry across all shards)
+    # instead of growing unboundedly over a multi-hour run. FIFO
+    # eviction just silently skips the check for a key that ages out
+    # before its next retrieve.
+    _MAX_TRACKED_KEYS_TOTAL = 1_000_000
 
     # How often (in processed jobs) to log a queue-wait summary -- lets
-    # us see from a run's log whether the worker ever neared the TTL
+    # us see from a run's log whether this shard ever neared the TTL
     # boundary, even on a clean run where the skip guard never fires.
     _WAIT_LOG_INTERVAL = 2000
 
-    def __init__(self, manager: "L1Manager") -> None:
+    def __init__(self, manager: "L1Manager", max_tracked_keys: int, index: int) -> None:
         self._manager = manager
+        self._max_tracked_keys = max_tracked_keys
+        self._index = index
         self._queue: "queue.Queue[_HashCheckJob | None]" = queue.Queue()
         # key -> (hash, data_ptr, store_time) for the most recent store.
+        # Private to this shard -- no lock needed.
         self._last_store: "OrderedDict[ObjectKey, tuple[int, int, float]]" = (
             OrderedDict()
         )
         self._jobs_processed = 0
         self._max_wait_since_last_log = 0.0
         self._thread = threading.Thread(
-            target=self._run, name="lmcache-hash-check-debug", daemon=True
+            target=self._run,
+            name=f"lmcache-hash-check-debug-{index}",
+            daemon=True,
         )
         self._thread.start()
 
@@ -112,9 +116,10 @@ class _HashCheckWorker:
             self._jobs_processed += 1
             if self._jobs_processed % self._WAIT_LOG_INTERVAL == 0:
                 logger.info(
-                    "L1Manager: hash-check queue-wait summary: "
+                    "L1Manager: hash-check shard %d queue-wait summary: "
                     "jobs_processed=%d max_wait_s_this_window=%.3f "
                     "queue_depth_now=%d",
+                    self._index,
                     self._jobs_processed,
                     self._max_wait_since_last_log,
                     self._queue.qsize(),
@@ -124,22 +129,33 @@ class _HashCheckWorker:
                 # The per-key lock stays held while queued, but its TTL
                 # (600s write / 300s read) expires on its own timer
                 # regardless -- if this job waited that long, the slot
-                # may have been legitimately reused, and hashing it would
-                # be a false positive from this debug patch, not the real
-                # bug. Detected via data_ptr change (coarse: an in-place
-                # reuse at the same address, possible since L1 uses a
-                # free-list allocator, would slip through -- accepted
-                # residual risk, not worth a lock round-trip per job to
-                # close).
-                if job.entry.memory_obj.data_ptr != job.data_ptr:
+                # may have been legitimately reused, and hashing it
+                # would be a false positive from this debug patch, not
+                # the real bug. Two independent, lock-free checks catch
+                # this: (1) the lock's own is_locked() -- False means the
+                # TTL fired and nobody re-locked it since; (2) data_ptr
+                # unchanged -- catches the case where TTL expiry AND a
+                # fresh reserve_write's lock() both landed before we got
+                # here (rare, needs a race inside our own dequeue-to-check
+                # gap, not the whole queue-wait window). A stale, freed
+                # MemoryObj's byte_array still reads real bytes at that
+                # physical address (invalidate() doesn't unmap the
+                # tensor), so skipping on either signal, rather than
+                # trusting one, is what actually closes this -- verified
+                # necessary in practice: a run with only the data_ptr
+                # check saw 100% of its mismatches sitting at/above the
+                # TTL boundary with the guard never firing.
+                lock = job.entry.write_lock if job.is_store else job.entry.read_lock
+                if not lock.is_locked() or job.entry.memory_obj.data_ptr != job.data_ptr:
                     logger.warning(
                         "L1Manager: HASH CHECK TTL EXPIRY (not a real "
                         "corruption finding -- debug-patch artifact, "
                         "comparison skipped) on %s for key %s: "
-                        "queued_data_ptr=%s current_data_ptr=%s "
-                        "is_store=%s queue_wait_s=%s",
+                        "lock_still_locked=%s queued_data_ptr=%s "
+                        "current_data_ptr=%s is_store=%s queue_wait_s=%s",
                         "store" if job.is_store else "retrieve",
                         job.key,
+                        lock.is_locked(),
                         job.data_ptr,
                         job.entry.memory_obj.data_ptr,
                         job.is_store,
@@ -154,7 +170,7 @@ class _HashCheckWorker:
                         job.timestamp,
                     )
                     self._last_store.move_to_end(job.key)
-                    if len(self._last_store) > self._MAX_TRACKED_KEYS:
+                    if len(self._last_store) > self._max_tracked_keys:
                         self._last_store.popitem(last=False)
                 else:
                     prior = self._last_store.get(job.key)
@@ -190,13 +206,49 @@ class _HashCheckWorker:
                     )
 
 
+class _HashCheckWorker:
+    """[LMCACHE_HASH_CHECK_DEBUG] Routes jobs to a fixed pool of
+    ``_HashCheckShard`` instances, keyed by ``hash(ObjectKey)``, so a
+    key's jobs always land on the same shard (preserving per-key
+    ordering) while different keys drain in parallel. Sharding is
+    necessary at real traffic volumes: a single-threaded version was
+    tried and its queue grew unboundedly (100k+ jobs deep within an
+    hour at 5 QPS), which itself produced TTL-expiry false positives
+    -- see the TTL-expiry check above for how those are now caught
+    regardless of shard count.
+    """
+
+    def __init__(self, manager: "L1Manager", num_shards: int) -> None:
+        if num_shards < 1:
+            raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+        max_tracked_keys = max(
+            1, _HashCheckShard._MAX_TRACKED_KEYS_TOTAL // num_shards
+        )
+        self._shards = [
+            _HashCheckShard(manager, max_tracked_keys, i) for i in range(num_shards)
+        ]
+
+    def submit(self, job: _HashCheckJob) -> None:
+        shard = self._shards[hash(job.key) % len(self._shards)]
+        shard.submit(job)
+
+
 _hash_check_worker: "_HashCheckWorker | None" = None
+
+# Number of shards (queue + thread + private _last_store table). A
+# single shard's one thread cannot keep pace with real traffic (5 QPS x
+# many KV chunks/request, each a zlib.crc32 over an ~18MB DeepSeek-V3
+# MLA object) -- verified via queue-wait telemetry showing unbounded
+# growth with 1 shard. More shards = more parallel drain throughput.
+LMCACHE_HASH_CHECK_NUM_SHARDS = max(
+    1, int(os.getenv("LMCACHE_HASH_CHECK_NUM_SHARDS", "8"))
+)
 
 
 def _get_hash_check_worker(manager: "L1Manager") -> _HashCheckWorker:
     global _hash_check_worker
     if _hash_check_worker is None:
-        _hash_check_worker = _HashCheckWorker(manager)
+        _hash_check_worker = _HashCheckWorker(manager, LMCACHE_HASH_CHECK_NUM_SHARDS)
     return _hash_check_worker
 
 
