@@ -131,20 +131,26 @@ class _HashCheckShard:
                 # regardless -- if this job waited that long, the slot
                 # may have been legitimately reused, and hashing it
                 # would be a false positive from this debug patch, not
-                # the real bug. Two independent, lock-free checks catch
-                # this: (1) the lock's own is_locked() -- False means the
-                # TTL fired and nobody re-locked it since; (2) data_ptr
-                # unchanged -- catches the case where TTL expiry AND a
-                # fresh reserve_write's lock() both landed before we got
-                # here (rare, needs a race inside our own dequeue-to-check
-                # gap, not the whole queue-wait window). A stale, freed
-                # MemoryObj's byte_array still reads real bytes at that
-                # physical address (invalidate() doesn't unmap the
-                # tensor), so skipping on either signal, rather than
-                # trusting one, is what actually closes this -- verified
-                # necessary in practice: a run with only the data_ptr
-                # check saw 100% of its mismatches sitting at/above the
+                # the real bug. Two checks: is_locked() (False = our TTL
+                # fired, nobody re-locked since) and data_ptr unchanged
+                # (catches TTL-expiry + immediate re-lock landing before
+                # we get here). Verified necessary: a run with only the
+                # data_ptr check saw 100% of its mismatches at/above the
                 # TTL boundary with the guard never firing.
+                #
+                # IMPORTANT LIMITATION (independent Opus code review,
+                # 2026-07-27): this guard cannot distinguish "I skipped
+                # because MY queueing was slow" from "this IS the real
+                # bug" -- premature free + reuse (the actual mechanism
+                # under investigation) produces the identical signature
+                # (lock not held / data_ptr changed) that this guard
+                # uses to skip. So a real corruption event can be
+                # silently absorbed here instead of logged as a
+                # MISMATCH. A logged HASH CHECK MISMATCH remains solid,
+                # one-directional evidence the bug fired; a run with
+                # zero mismatches or many TTL EXPIRY skips is NOT
+                # evidence the bug didn't fire -- only that this run
+                # didn't catch it. Accepted tradeoff, not fixed further.
                 lock = job.entry.write_lock if job.is_store else job.entry.read_lock
                 if not lock.is_locked() or job.entry.memory_obj.data_ptr != job.data_ptr:
                     logger.warning(
