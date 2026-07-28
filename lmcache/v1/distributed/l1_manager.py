@@ -83,8 +83,15 @@ class _HashCheckShard:
     # boundary, even on a clean run where the skip guard never fires.
     _WAIT_LOG_INTERVAL = 2000
 
-    def __init__(self, manager: "L1Manager", max_tracked_keys: int, index: int) -> None:
+    def __init__(
+        self,
+        manager: "L1Manager",
+        worker: "_HashCheckWorker",
+        max_tracked_keys: int,
+        index: int,
+    ) -> None:
         self._manager = manager
+        self._worker = worker
         self._max_tracked_keys = max_tracked_keys
         self._index = index
         self._queue: "queue.Queue[_HashCheckJob | None]" = queue.Queue()
@@ -178,7 +185,35 @@ class _HashCheckShard:
                     self._last_store.move_to_end(job.key)
                     if len(self._last_store) > self._max_tracked_keys:
                         self._last_store.popitem(last=False)
+                    # [LMCACHE_HASH_CHECK_DEBUG] slot-provenance: record
+                    # this key as the current legitimate owner of the
+                    # physical slot. Catches "correct bytes, wrong key"
+                    # mixups that the byte-hash check above is blind to
+                    # (nothing at the byte level changes in that case).
+                    self._worker.record_store_provenance(
+                        job.data_ptr, job.key, job.timestamp
+                    )
                 else:
+                    mismatch = self._worker.check_retrieve_provenance(
+                        job.data_ptr, job.key
+                    )
+                    if mismatch is not None:
+                        owner_key, store_time = mismatch
+                        logger.warning(
+                            "L1Manager: HASH CHECK SLOT PROVENANCE MISMATCH "
+                            "on retrieve for key %s: data_ptr=%s "
+                            "recorded_owner_key=%s recorded_store_time=%s "
+                            "retrieve_time=%s elapsed_s=%s "
+                            "byte_hash_matched=%s",
+                            job.key,
+                            job.data_ptr,
+                            owner_key,
+                            store_time,
+                            job.timestamp,
+                            job.timestamp - store_time,
+                            content_hash
+                            == self._last_store.get(job.key, (None,))[0],
+                        )
                     prior = self._last_store.get(job.key)
                     if prior is not None:
                         store_hash, store_data_ptr, store_time = prior
@@ -222,7 +257,28 @@ class _HashCheckWorker:
     hour at 5 QPS), which itself produced TTL-expiry false positives
     -- see the TTL-expiry check above for how those are now caught
     regardless of shard count.
+
+    Also owns the slot-provenance table (see
+    ``record_store_provenance``/``check_retrieve_provenance``):
+    ``data_ptr -> (owner_key, store_time)``, recording which key most
+    recently stored into each physical CPU slot. This is process-wide
+    and mutex-guarded, NOT per-shard -- provenance is keyed by physical
+    address, a different axis than the ``hash(ObjectKey)`` shards route
+    on. Key A stores into slot P (routes to shard hash(A)%n), gets
+    evicted, P is legitimately reallocated to key B (routes to shard
+    hash(B)%n, likely a *different* shard). A per-shard table would let
+    A's shard never see B's overwrite of the same physical slot,
+    producing false mixup reports. The shared lock here only guards
+    O(1) dict ops (microseconds) -- never the expensive
+    zlib.crc32 over an ~18MB buffer, which stays fully parallel across
+    shard threads.
     """
+
+    # Bounds worst-case memory for the provenance table. Distinct
+    # physical slots is naturally smaller and more stable than distinct
+    # keys (a fixed L1 pool has a bounded slot count), but capped
+    # anyway for safety on a long-running debug patch.
+    _MAX_TRACKED_SLOTS = 1_000_000
 
     def __init__(self, manager: "L1Manager", num_shards: int) -> None:
         if num_shards < 1:
@@ -231,12 +287,43 @@ class _HashCheckWorker:
             1, _HashCheckShard._MAX_TRACKED_KEYS_TOTAL // num_shards
         )
         self._shards = [
-            _HashCheckShard(manager, max_tracked_keys, i) for i in range(num_shards)
+            _HashCheckShard(manager, self, max_tracked_keys, i)
+            for i in range(num_shards)
         ]
+        self._provenance_lock = threading.Lock()
+        # data_ptr -> (owner_key, store_time). Shared across all shards.
+        self._provenance: "OrderedDict[int, tuple[ObjectKey, float]]" = OrderedDict()
 
     def submit(self, job: _HashCheckJob) -> None:
         shard = self._shards[hash(job.key) % len(self._shards)]
         shard.submit(job)
+
+    def record_store_provenance(self, data_ptr: int, key: ObjectKey, when: float) -> None:
+        """Unconditionally record ``key`` as the current legitimate
+        owner of ``data_ptr``. Called on every store -- whoever most
+        recently stored into a slot is, by definition, its current
+        owner, whether this is a first store or a legitimate reuse
+        after eviction."""
+        with self._provenance_lock:
+            self._provenance[data_ptr] = (key, when)
+            self._provenance.move_to_end(data_ptr)
+            if len(self._provenance) > self._MAX_TRACKED_SLOTS:
+                self._provenance.popitem(last=False)
+
+    def check_retrieve_provenance(
+        self, data_ptr: int, retrieve_key: ObjectKey
+    ) -> "tuple[ObjectKey, float] | None":
+        """Return the recorded ``(owner_key, store_time)`` for
+        ``data_ptr`` if a mismatch against ``retrieve_key`` is found,
+        else None (no record, or owner matches -- both are fine)."""
+        with self._provenance_lock:
+            record = self._provenance.get(data_ptr)
+        if record is None:
+            return None
+        owner_key, _store_time = record
+        if owner_key == retrieve_key:
+            return None
+        return record
 
 
 _hash_check_worker: "_HashCheckWorker | None" = None
