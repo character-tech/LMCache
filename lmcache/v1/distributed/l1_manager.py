@@ -191,14 +191,14 @@ class _HashCheckShard:
                     # mixups that the byte-hash check above is blind to
                     # (nothing at the byte level changes in that case).
                     self._worker.record_store_provenance(
-                        job.data_ptr, job.key, job.timestamp
+                        job.data_ptr, job.key, job.timestamp, content_hash
                     )
                 else:
                     mismatch = self._worker.check_retrieve_provenance(
                         job.data_ptr, job.key
                     )
                     if mismatch is not None:
-                        owner_key, store_time = mismatch
+                        owner_key, store_time, owner_store_hash = mismatch
                         logger.warning(
                             "L1Manager: HASH CHECK SLOT PROVENANCE MISMATCH "
                             "on retrieve for key %s: data_ptr=%s "
@@ -211,8 +211,7 @@ class _HashCheckShard:
                             store_time,
                             job.timestamp,
                             job.timestamp - store_time,
-                            content_hash
-                            == self._last_store.get(job.key, (None,))[0],
+                            content_hash == owner_store_hash,
                         )
                     prior = self._last_store.get(job.key)
                     if prior is not None:
@@ -260,11 +259,17 @@ class _HashCheckWorker:
 
     Also owns the slot-provenance table (see
     ``record_store_provenance``/``check_retrieve_provenance``):
-    ``data_ptr -> (owner_key, store_time)``, recording which key most
-    recently stored into each physical CPU slot. This is process-wide
-    and mutex-guarded, NOT per-shard -- provenance is keyed by physical
-    address, a different axis than the ``hash(ObjectKey)`` shards route
-    on. Key A stores into slot P (routes to shard hash(A)%n), gets
+    ``data_ptr -> (owner_key, store_time, store_hash)``, recording which
+    key most recently stored into each physical CPU slot, and that
+    store's byte-hash (needed for ``byte_hash_matched`` on a mismatch --
+    the owner's store hash lives on the OWNER's shard, e.g. shard
+    hash(A)%n, which is not safely reachable from the RETRIEVING key's
+    shard, e.g. shard hash(B)%n's ``_last_store``; carrying the hash in
+    the shared provenance record avoids reaching across shards). This
+    table is process-wide and mutex-guarded, NOT per-shard -- provenance
+    is keyed by physical address, a different axis than the
+    ``hash(ObjectKey)`` shards route on. Key A stores into slot P
+    (routes to shard hash(A)%n), gets
     evicted, P is legitimately reallocated to key B (routes to shard
     hash(B)%n, likely a *different* shard). A per-shard table would let
     A's shard never see B's overwrite of the same physical slot,
@@ -291,36 +296,45 @@ class _HashCheckWorker:
             for i in range(num_shards)
         ]
         self._provenance_lock = threading.Lock()
-        # data_ptr -> (owner_key, store_time). Shared across all shards.
-        self._provenance: "OrderedDict[int, tuple[ObjectKey, float]]" = OrderedDict()
+        # data_ptr -> (owner_key, store_time, store_hash). Shared across
+        # all shards.
+        self._provenance: "OrderedDict[int, tuple[ObjectKey, float, int]]" = (
+            OrderedDict()
+        )
 
     def submit(self, job: _HashCheckJob) -> None:
         shard = self._shards[hash(job.key) % len(self._shards)]
         shard.submit(job)
 
-    def record_store_provenance(self, data_ptr: int, key: ObjectKey, when: float) -> None:
+    def record_store_provenance(
+        self, data_ptr: int, key: ObjectKey, when: float, store_hash: int
+    ) -> None:
         """Unconditionally record ``key`` as the current legitimate
         owner of ``data_ptr``. Called on every store -- whoever most
         recently stored into a slot is, by definition, its current
         owner, whether this is a first store or a legitimate reuse
-        after eviction."""
+        after eviction. ``store_hash`` is carried here (not looked up
+        later from a shard's ``_last_store``) so a later cross-shard
+        retrieve can compute ``byte_hash_matched`` without reaching
+        into another shard's private table."""
         with self._provenance_lock:
-            self._provenance[data_ptr] = (key, when)
+            self._provenance[data_ptr] = (key, when, store_hash)
             self._provenance.move_to_end(data_ptr)
             if len(self._provenance) > self._MAX_TRACKED_SLOTS:
                 self._provenance.popitem(last=False)
 
     def check_retrieve_provenance(
         self, data_ptr: int, retrieve_key: ObjectKey
-    ) -> "tuple[ObjectKey, float] | None":
-        """Return the recorded ``(owner_key, store_time)`` for
-        ``data_ptr`` if a mismatch against ``retrieve_key`` is found,
-        else None (no record, or owner matches -- both are fine)."""
+    ) -> "tuple[ObjectKey, float, int] | None":
+        """Return the recorded ``(owner_key, store_time, store_hash)``
+        for ``data_ptr`` if a mismatch against ``retrieve_key`` is
+        found, else None (no record, or owner matches -- both are
+        fine)."""
         with self._provenance_lock:
             record = self._provenance.get(data_ptr)
         if record is None:
             return None
-        owner_key, _store_time = record
+        owner_key, _store_time, _store_hash = record
         if owner_key == retrieve_key:
             return None
         return record
