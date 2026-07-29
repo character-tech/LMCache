@@ -329,7 +329,19 @@ class _HashCheckWorker:
         """Return the recorded ``(owner_key, store_time, store_hash)``
         for ``data_ptr`` if a mismatch against ``retrieve_key`` is
         found, else None (no record, or owner matches -- both are
-        fine)."""
+        fine).
+
+        KNOWN LIMITATION (independent Opus review, 2026-07-29): a
+        store and a same-slot retrieve can land on different shards
+        (``hash(owner_key)%n`` vs ``hash(retrieve_key)%n``), so there
+        is no cross-shard happens-before guarantee between them. If
+        the retrieve's shard drains before the store's shard, this
+        check sees a stale or missing owner record -- a false
+        negative or misattributed owner, never a false positive.
+        One-directional, same evidentiary philosophy as the
+        TTL-expiry guard above: a logged mismatch stays solid
+        evidence, but a clean check here is not proof a mixup didn't
+        happen."""
         with self._provenance_lock:
             record = self._provenance.get(data_ptr)
         if record is None:
