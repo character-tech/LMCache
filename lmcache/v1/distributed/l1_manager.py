@@ -102,6 +102,15 @@ class _HashCheckShard:
         )
         self._jobs_processed = 0
         self._max_wait_since_last_log = 0.0
+        # Positive-confirmation counters -- proves the checks actually
+        # ran and compared (not just silently skipped), since a
+        # WARNING-only mismatch log gives no evidence of a clean
+        # comparison happening at all. Reset each _WAIT_LOG_INTERVAL
+        # window, same cadence as the queue-wait summary below.
+        self._byte_hash_compared_clean = 0
+        self._provenance_compared_clean = 0
+        self._ttl_expiry_skips = 0
+        self._logged_first_comparison = False
         self._thread = threading.Thread(
             target=self._run,
             name=f"lmcache-hash-check-debug-{index}",
@@ -125,13 +134,20 @@ class _HashCheckShard:
                 logger.info(
                     "L1Manager: hash-check shard %d queue-wait summary: "
                     "jobs_processed=%d max_wait_s_this_window=%.3f "
-                    "queue_depth_now=%d",
+                    "queue_depth_now=%d byte_hash_compared_clean=%d "
+                    "provenance_compared_clean=%d ttl_expiry_skips=%d",
                     self._index,
                     self._jobs_processed,
                     self._max_wait_since_last_log,
                     self._queue.qsize(),
+                    self._byte_hash_compared_clean,
+                    self._provenance_compared_clean,
+                    self._ttl_expiry_skips,
                 )
                 self._max_wait_since_last_log = 0.0
+                self._byte_hash_compared_clean = 0
+                self._provenance_compared_clean = 0
+                self._ttl_expiry_skips = 0
             try:
                 # The per-key lock stays held while queued, but its TTL
                 # (600s write / 300s read) expires on its own timer
@@ -160,6 +176,7 @@ class _HashCheckShard:
                 # didn't catch it. Accepted tradeoff, not fixed further.
                 lock = job.entry.write_lock if job.is_store else job.entry.read_lock
                 if not lock.is_locked() or job.entry.memory_obj.data_ptr != job.data_ptr:
+                    self._ttl_expiry_skips += 1
                     logger.warning(
                         "L1Manager: HASH CHECK TTL EXPIRY (not a real "
                         "corruption finding -- debug-patch artifact, "
@@ -194,6 +211,9 @@ class _HashCheckShard:
                         job.data_ptr, job.key, job.timestamp, content_hash
                     )
                 else:
+                    had_provenance_record = self._worker.has_provenance_record(
+                        job.data_ptr
+                    )
                     mismatch = self._worker.check_retrieve_provenance(
                         job.data_ptr, job.key
                     )
@@ -213,6 +233,13 @@ class _HashCheckShard:
                             job.timestamp - store_time,
                             content_hash == owner_store_hash,
                         )
+                    elif had_provenance_record:
+                        # Record existed AND matched (mismatch is None
+                        # for both "no record" and "matched" -- this
+                        # branch is specifically the matched case, our
+                        # positive confirmation the provenance check
+                        # ran and compared cleanly).
+                        self._provenance_compared_clean += 1
                     prior = self._last_store.get(job.key)
                     if prior is not None:
                         store_hash, store_data_ptr, store_time = prior
@@ -234,6 +261,22 @@ class _HashCheckShard:
                                 job.data_ptr,
                                 same_ptr,
                             )
+                        else:
+                            self._byte_hash_compared_clean += 1
+                            if not self._logged_first_comparison:
+                                self._logged_first_comparison = True
+                                logger.info(
+                                    "L1Manager: hash-check shard %d "
+                                    "CONFIRMED ACTIVE -- first successful "
+                                    "clean comparison on key %s: "
+                                    "byte_hash_matched=True "
+                                    "had_provenance_record=%s "
+                                    "elapsed_s=%s",
+                                    self._index,
+                                    job.key,
+                                    had_provenance_record,
+                                    job.timestamp - store_time,
+                                )
             finally:
                 # Always release, even if hashing/logging raised, so a
                 # bug in this debug path can never leak a permanently
@@ -322,6 +365,15 @@ class _HashCheckWorker:
             self._provenance.move_to_end(data_ptr)
             if len(self._provenance) > self._MAX_TRACKED_SLOTS:
                 self._provenance.popitem(last=False)
+
+    def has_provenance_record(self, data_ptr: int) -> bool:
+        """Whether a provenance record exists for ``data_ptr``, purely
+        for positive-confirmation telemetry (distinguishing "no record
+        to compare against" from "compared and matched" -- both return
+        None from ``check_retrieve_provenance`` below). Never used for
+        the mismatch decision itself."""
+        with self._provenance_lock:
+            return data_ptr in self._provenance
 
     def check_retrieve_provenance(
         self, data_ptr: int, retrieve_key: ObjectKey
