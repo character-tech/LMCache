@@ -61,6 +61,16 @@ class MPServerConfig:
     (STORE/RETRIEVE, supports CUDA IPC and CPU SHM), 'engine_driven' for
     engine-driven transfer (PREPARE/COMMIT), or 'auto' to enable both."""
 
+    sync_mode: bool = False
+    """When True, store() and retrieve() block until their GPU stream work
+    (D2H/H2D copy plus the finish_write/finish_read_prefetched completion
+    callback) has actually finished, instead of returning immediately after
+    enqueuing the work and signaling completion asynchronously later. This is
+    a diagnostic/mitigation flag for a suspected race where the L1Manager
+    lock is released via the async completion signal before the underlying
+    memory transfer has physically landed. Costs throughput; default is
+    False (existing async behavior)."""
+
     runtime_plugin_config: "RuntimePluginConfig" = field(
         default_factory=lambda: RuntimePluginConfig()
     )
@@ -311,6 +321,16 @@ def add_mp_server_args(
         "or 'auto' to enable both transfer paths. Default is 'auto'.",
     )
     mp_group.add_argument(
+        "--sync-mode",
+        action="store_true",
+        help="Block store()/retrieve() until their GPU stream work has "
+        "actually completed (D2H/H2D copy plus the finish_write/"
+        "finish_read_prefetched callback), instead of returning immediately "
+        "after enqueuing the work. Diagnostic/mitigation flag for a "
+        "suspected async completion-signaling race. Costs throughput. "
+        "Default is False (existing async behavior).",
+    )
+    mp_group.add_argument(
         "--runtime-plugin-locations",
         type=str,
         nargs="*",
@@ -409,6 +429,7 @@ def parse_args_to_mp_server_config(
         separate_object_groups=args.separate_object_groups,
         enable_segmented_prefix=args.enable_segmented_prefix,
         supported_transfer_mode=args.supported_transfer_mode,
+        sync_mode=args.sync_mode,
         runtime_plugin_config=RuntimePluginConfig(
             locations=(args.runtime_plugin_locations or []),
             extra_config=plugin_extra,

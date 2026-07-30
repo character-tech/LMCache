@@ -127,3 +127,11 @@ def test_instance_id_defaults_are_distinct():
 def test_instance_id_dataclass_default_is_distinct():
     # Direct construction (no CLI) also mints a fresh id per instance.
     assert MPServerConfig().instance_id != MPServerConfig().instance_id
+
+
+def test_sync_mode_defaults_false():
+    assert _parse_mp([]).sync_mode is False
+
+
+def test_sync_mode_flag_enables_it():
+    assert _parse_mp(["--sync-mode"]).sync_mode is True
