@@ -93,8 +93,8 @@ __device__ inline size_t calculate_engine_local_offset(
            token_offset * shape_desc.kv_size * scalars_per_head +
            k_or_v * scalars_per_head;
   } else if constexpr (format == EngineKVFormat::NB_NL_TWO_NH_BS_HS ||
-                format == EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||
-                format == EngineKVFormat::NL_X_NB_TWO_NH_BS_HS) {
+                       format == EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||
+                       format == EngineKVFormat::NL_X_NB_TWO_NH_BS_HS) {
     // HND: [NH, BS, HS] — heads are outermost within a block
     size_t scalars_per_head_block =
         shape_desc.bs * scalars_per_head;  // BS * HS
