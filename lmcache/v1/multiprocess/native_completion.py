@@ -96,7 +96,19 @@ class DeviceHostFuncDispatcher:
         self._drain_once()
 
     def dispatched_count(self) -> int:
-        return self._dispatched_count  # single-writer; read is GIL-atomic
+        # Diagnostic only: _drain_once() runs from both the poll thread and
+        # drain_now(), so increments can race and occasionally be lost under
+        # the GIL, but this count is never used for correctness.
+        return self._dispatched_count
+
+    def drain_now(self) -> None:
+        """Synchronously drain and dispatch any completions already recorded
+        by the driver thread. Callable from any thread; does not wait for
+        new completions to be recorded — the caller must ensure the
+        relevant ``stream.synchronize()`` has already returned so the
+        driver-thread callback has had a chance to run before this is
+        called, otherwise there is nothing yet to drain."""
+        self._drain_once()
 
     def handler_exception_counts(self) -> dict[str, int]:
         with self._lock:

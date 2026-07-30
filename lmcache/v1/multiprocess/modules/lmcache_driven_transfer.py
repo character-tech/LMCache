@@ -420,10 +420,24 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
 
     Args:
         ctx: The shared engine context.
+        sync_mode: When True, store()/retrieve() block on
+            cache_context.stream.synchronize() before returning, so the
+            GPU transfer and the finish_write/finish_read_prefetched
+            callback (stream-ordered after it) are guaranteed complete
+            before the caller sees a result. Diagnostic/mitigation flag
+            for a suspected async completion-signaling race; costs
+            throughput. Defaults to False (existing async behavior).
     """
 
-    def __init__(self, ctx: MPCacheServerContext) -> None:
+    def __init__(self, ctx: MPCacheServerContext, sync_mode: bool = False) -> None:
         self._ctx = ctx
+        self._sync_mode = sync_mode
+        if self._sync_mode:
+            logger.debug(
+                "LMCacheDrivenTransferModule starting with sync_mode=True: "
+                "store()/retrieve() will block on cache_context.stream."
+                "synchronize() before returning."
+            )
         self._cache_contexts: dict[int, ContextEntry] = {}
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
@@ -891,6 +905,25 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     )
                 else:
                     total_bytes = 0
+                if self._sync_mode:
+                    # Block until the D2H copy has actually completed.
+                    cache_context.stream.synchronize()
+                    # synchronize() only guarantees the driver-thread callback
+                    # has recorded the completion into the native buffer, not
+                    # that the DeviceHostFuncDispatcher's poll thread has
+                    # drained it and run finish_write yet (that thread wakes
+                    # up to every 5ms on its own timer). Force a synchronous
+                    # drain here so the lock is released promptly rather than
+                    # up to 5ms late; the race window is already closed by
+                    # synchronize() above (the copy has landed), so the lock
+                    # is never released early even if drain_now() races the
+                    # poll thread and finds nothing to drain.
+                    self._device_host_func_dispatcher.drain_now()
+                    logger.debug(
+                        "sync_mode: store() stream synchronized and drained "
+                        "for request_id=%s",
+                        key.request_id,
+                    )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
@@ -1062,6 +1095,18 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                         cache_context.cupy_stream,
                         "finish_read_prefetched",
                         prefetched_keys,
+                    )
+                if self._sync_mode:
+                    # Block until the H2D copy has actually completed, then
+                    # force-drain the dispatcher (see the comment in store())
+                    # so finish_read_prefetched runs promptly rather than up
+                    # to 5ms late.
+                    cache_context.stream.synchronize()
+                    self._device_host_func_dispatcher.drain_now()
+                    logger.debug(
+                        "sync_mode: retrieve() stream synchronized and "
+                        "drained for request_id=%s",
+                        key.request_id,
                     )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
