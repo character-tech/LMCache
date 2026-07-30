@@ -51,6 +51,7 @@ FMT_SGLANG_MHA = lmc_ops.EngineKVFormat.TWO_X_NL_X_NBBS_NH_HS
 FMT_SGLANG_MLA = lmc_ops.EngineKVFormat.NL_X_NBBS_ONE_HS
 FMT_NORMAL_HND = lmc_ops.EngineKVFormat.NL_X_TWO_NB_NH_BS_HS
 FMT_FLASH_INFER_HND = lmc_ops.EngineKVFormat.NL_X_NB_TWO_NH_BS_HS
+FMT_BLOCKS_FIRST_FUSED = lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS
 
 # Format parameters: (engine_kv_format, num_layers, num_heads, head_size, is_mla)
 # Use small layer counts to keep GPU memory usage low in CI
@@ -63,6 +64,7 @@ FORMAT_PARAMS = [
     (FMT_SGLANG_MLA, 4, 1, 576, True),
     (FMT_NORMAL_HND, 4, 8, 128, False),
     (FMT_FLASH_INFER_HND, 4, 8, 128, False),
+    (FMT_BLOCKS_FIRST_FUSED, 4, 8, 128, False),
 ]
 
 
@@ -101,6 +103,9 @@ def create_vllm_tensors(
     elif engine_kv_format == FMT_SGLANG_MLA:
         shape = [nbbs, 1, hs]
         return [_create_random_tensor(shape, dtype, device) for _ in range(nl)]
+    elif engine_kv_format == FMT_BLOCKS_FIRST_FUSED:
+        shape = [nb, nh, bs, 2, hs]
+        return [_create_random_tensor(shape, dtype, device) for _ in range(nl)]
     raise ValueError(f"Unknown format: {engine_kv_format}")
 
 
@@ -138,6 +143,9 @@ def create_zero_vllm_tensors(
         return [_create_zero_tensor(shape, dtype, device) for _ in range(2 * nl)]
     elif engine_kv_format == FMT_SGLANG_MLA:
         shape = [nbbs, 1, hs]
+        return [_create_zero_tensor(shape, dtype, device) for _ in range(nl)]
+    elif engine_kv_format == FMT_BLOCKS_FIRST_FUSED:
+        shape = [nb, nh, bs, 2, hs]
         return [_create_zero_tensor(shape, dtype, device) for _ in range(nl)]
     raise ValueError(f"Unknown format: {engine_kv_format}")
 
@@ -185,6 +193,8 @@ def get_block_data(
         elif engine_kv_format == FMT_FLASH_INFER:
             results.append(vllm_tensors[layer_idx][block_idx, :, :, :, :].clone())
         elif engine_kv_format == FMT_FLASH_INFER_HND:
+            results.append(vllm_tensors[layer_idx][block_idx, :, :, :, :].clone())
+        elif engine_kv_format == FMT_BLOCKS_FIRST_FUSED:
             results.append(vllm_tensors[layer_idx][block_idx, :, :, :, :].clone())
         elif engine_kv_format == FMT_MLA:
             results.append(vllm_tensors[layer_idx][block_idx, :, :].clone())
@@ -272,6 +282,7 @@ TOTAL_BLOCKS = NUM_MEMORY_OBJECTS * BLOCKS_PER_OBJECT  # 64
         "sglang_mla",
         "normal_hnd",
         "flash_infer_hnd",
+        "blocks_first_fused",
     ],
 )
 @pytest.mark.parametrize(
@@ -375,6 +386,7 @@ def test_block_transfer_roundtrip(
         "sglang_mla",
         "normal_hnd",
         "flash_infer_hnd",
+        "blocks_first_fused",
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16], ids=["bf16"])
