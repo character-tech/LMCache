@@ -29,18 +29,24 @@ class VLLM_Detector(EngineDetector):
         # identifies it unambiguously (the post-split 5-D shape would collide
         # with flash-infer when num_heads == 2). Split [NB, NH, BS, 2*HS] into
         # [NB, NH, BS, 2, HS].
+        #
+        # Hybrid models (e.g. google/gemma-4-E4B-it) mix SWA and full-attention
+        # layers with different head configs, so fused_dim is per-tensor, not
+        # uniform across the model.
         if (
             isinstance(kv_caches, list)
             and kv_caches
             and isinstance(kv_caches[0], torch.Tensor)
             and kv_caches[0].dim() == 4
         ):
-            fused_dim = kv_caches[0].shape[3]
-            if fused_dim % 2 != 0:
-                raise ValueError(
-                    f"blocks-first fused trailing dim {fused_dim} is not 2 * head_size"
-                )
-            split = [t.reshape(*t.shape[:3], 2, fused_dim // 2) for t in kv_caches]
+            split = []
+            for t in kv_caches:
+                fused_dim = t.shape[3]
+                if fused_dim % 2 != 0:
+                    raise ValueError(
+                        f"fused trailing dim {fused_dim} is not 2 * head_size"
+                    )
+                split.append(t.reshape(*t.shape[:3], 2, fused_dim // 2))
             return lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS, split
 
         list_depth, tensor_ndim, first_tensor = measure_list_depth_until_tensor(

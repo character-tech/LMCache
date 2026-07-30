@@ -73,6 +73,20 @@ def test_vllm_blocks_first_fused_num_heads_2():
     assert tuple(out[0].shape) == (NB, 2, BS, 2, HS)
 
 
+def test_vllm_blocks_first_fused_hybrid_shapes():
+    # Hybrid models (e.g. google/gemma-4-E4B-it) mix layers with different
+    # trailing dims; each tensor must reshape by its own fused_dim.
+    swa = [_t(NB, NH, BS, 2 * HS) for _ in range(NL)]
+    full_attn = [_t(NB, NH * 2, BS, HS) for _ in range(NL)]
+    raw = swa + full_attn
+    fmt, out = detect_format(raw, EngineType.VLLM, {"kv_layout": "HND"})
+    assert fmt == F.NL_X_NB_NH_BS_TWO_HS
+    for t in out[:NL]:
+        assert tuple(t.shape) == (NB, NH, BS, 2, HS)
+    for t in out[NL:]:
+        assert tuple(t.shape) == (NB, NH * 2, BS, 2, HS // 2)
+
+
 def test_sglang_mla_depth1():
     kv = [_t(NB * BS, 1, HS) for _ in range(NL)]
     fmt, _ = detect_format(kv, EngineType.SGLANG, {})
