@@ -68,6 +68,13 @@ __device__ inline size_t calculate_engine_global_offset(
            layer_idx * shape_desc.kv_size * scalars_per_block +
            engine_block_idx * shape_desc.kv_size * scalars_per_block *
                shape_desc.nl;
+  } else if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS) {
+    // vLLM blocks-first fused K/V (HND): L tensors [NB, NH, BS, 2, HS]. The
+    // K/V axis sits between token and head_size within each block (not a
+    // separate leading axis like the other HND formats above), so k_or_v
+    // does not shift the block-level offset here -- it is folded into
+    // calculate_engine_local_offset below instead.
+    return engine_block_idx * shape_desc.kv_size * scalars_per_block;
   }
 }
 
@@ -78,10 +85,17 @@ __device__ inline size_t calculate_engine_global_offset(
 template <typename ScalarType, EngineKVFormat format>
 __device__ inline size_t calculate_engine_local_offset(
     const int token_offset, const int head_idx,
-    const PageBufferShapeDesc shape_desc) {
+    const PageBufferShapeDesc shape_desc, const int k_or_v = 0) {
   size_t scalars_per_head = shape_desc.scalars_per_head<ScalarType>();
   size_t scalars_per_token = shape_desc.scalars_per_token<ScalarType>();
-  if constexpr (format == EngineKVFormat::NB_NL_TWO_NH_BS_HS ||
+  if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS) {
+    // HND with K/V fused between token and head_size: [NH, BS, 2, HS].
+    size_t scalars_per_head_block =
+        shape_desc.kv_size * shape_desc.bs * scalars_per_head;  // BS * 2 * HS
+    return head_idx * scalars_per_head_block +
+           token_offset * shape_desc.kv_size * scalars_per_head +
+           k_or_v * scalars_per_head;
+  } else if constexpr (format == EngineKVFormat::NB_NL_TWO_NH_BS_HS ||
                 format == EngineKVFormat::NL_X_TWO_NB_NH_BS_HS ||
                 format == EngineKVFormat::NL_X_NB_TWO_NH_BS_HS) {
     // HND: [NH, BS, HS] — heads are outermost within a block
@@ -204,8 +218,8 @@ __device__ void multi_layer_block_transfer_single_block(
 
   for (int token_offset = 0; token_offset < shape_desc.bs; ++token_offset) {
     const size_t engine_local_offset =
-        calculate_engine_local_offset<ScalarType, format>(token_offset,
-                                                          head_idx, shape_desc);
+        calculate_engine_local_offset<ScalarType, format>(
+            token_offset, head_idx, shape_desc, k_or_v);
     const size_t lmcache_local_offset =
         calculate_lmcache_local_offset<ScalarType, format>(
             token_offset, head_idx, shape_desc);
@@ -290,6 +304,9 @@ __global__ void multi_layer_block_transfer_kernel(
       break;                                                            \
     case EngineKVFormat::NB_NL_TWO_NH_BS_HS:                            \
       LAUNCH_KERNEL(DIRECTION, EngineKVFormat::NB_NL_TWO_NH_BS_HS);     \
+      break;                                                            \
+    case EngineKVFormat::NL_X_NB_NH_BS_TWO_HS:                          \
+      LAUNCH_KERNEL(DIRECTION, EngineKVFormat::NL_X_NB_NH_BS_TWO_HS);   \
       break;                                                            \
     default:                                                            \
       TORCH_CHECK(false, "Unsupported EngineKVFormat: ",                \
