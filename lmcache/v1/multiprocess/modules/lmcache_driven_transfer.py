@@ -429,9 +429,7 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             throughput. Defaults to False (existing async behavior).
     """
 
-    def __init__(
-        self, ctx: MPCacheServerContext, sync_mode: bool = False
-    ) -> None:
+    def __init__(self, ctx: MPCacheServerContext, sync_mode: bool = False) -> None:
         self._ctx = ctx
         self._sync_mode = sync_mode
         if self._sync_mode:
