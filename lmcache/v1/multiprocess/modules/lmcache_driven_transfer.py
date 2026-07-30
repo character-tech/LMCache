@@ -913,8 +913,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     # that the DeviceHostFuncDispatcher's poll thread has
                     # drained it and run finish_write yet (that thread wakes
                     # up to every 5ms on its own timer). Force a synchronous
-                    # drain here so the L1Manager lock is actually released
-                    # before this call returns.
+                    # drain here so the lock is released promptly rather than
+                    # up to 5ms late; the race window is already closed by
+                    # synchronize() above (the copy has landed), so the lock
+                    # is never released early even if drain_now() races the
+                    # poll thread and finds nothing to drain.
                     self._device_host_func_dispatcher.drain_now()
                     logger.debug(
                         "sync_mode: store() stream synchronized and drained "
@@ -1096,8 +1099,8 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 if self._sync_mode:
                     # Block until the H2D copy has actually completed, then
                     # force-drain the dispatcher (see the comment in store())
-                    # so finish_read_prefetched has actually run and released
-                    # the L1Manager lock before this call returns.
+                    # so finish_read_prefetched runs promptly rather than up
+                    # to 5ms late.
                     cache_context.stream.synchronize()
                     self._device_host_func_dispatcher.drain_now()
                     logger.debug(

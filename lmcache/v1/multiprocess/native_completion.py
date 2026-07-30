@@ -96,7 +96,10 @@ class DeviceHostFuncDispatcher:
         self._drain_once()
 
     def dispatched_count(self) -> int:
-        return self._dispatched_count  # single-writer; read is GIL-atomic
+        # Diagnostic only: _drain_once() runs from both the poll thread and
+        # drain_now(), so increments can race and occasionally be lost under
+        # the GIL, but this count is never used for correctness.
+        return self._dispatched_count
 
     def drain_now(self) -> None:
         """Synchronously drain and dispatch any completions already recorded

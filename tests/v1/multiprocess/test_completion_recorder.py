@@ -5,6 +5,7 @@
 # Standard
 import threading
 import time
+from unittest.mock import patch
 
 # Third Party
 import msgspec
@@ -36,6 +37,14 @@ except ImportError:
 native_only = pytest.mark.skipif(
     not (_has_cuda and _has_native_op),
     reason="requires CUDA and native record_completion_on_stream",
+)
+
+# native_completion.py imports lmcache.c_ops at module scope (for the drain
+# call), so even a fully-mocked drain still needs the compiled extension
+# importable -- but not an actual CUDA device.
+native_ext_only = pytest.mark.skipif(
+    not _has_native_op,
+    reason="requires the native lmcache.c_ops extension to be importable",
 )
 
 if _has_cuda and _has_native_op:
@@ -150,6 +159,37 @@ class TestDispatcher:
         while time.monotonic() < deadline and not seen:
             time.sleep(0.01)
         assert seen == [(42, "hello")]
+
+
+@native_ext_only
+class TestDrainNow:
+    """drain_now() must dispatch synchronously on the calling thread, without
+    needing a live GPU or the poll thread to wake up on its own timer."""
+
+    def test_drain_now_dispatches_synchronously(self):
+        dispatcher = DeviceHostFuncDispatcher(drain_interval_seconds=3600)
+        seen: list[list[bytes]] = []
+        dispatcher.register("finish_write", seen.append, payload_type=list[bytes])
+
+        encoded = msgspec.msgpack.encode([b"k0", b"k1"])
+        with patch(
+            "lmcache.v1.multiprocess.native_completion._lmc_ops"
+            ".drain_recorded_completions",
+            return_value=[("finish_write", encoded)],
+        ):
+            dispatcher.drain_now()
+
+        assert seen == [[b"k0", b"k1"]]
+
+    def test_drain_now_is_noop_when_nothing_recorded(self):
+        dispatcher = DeviceHostFuncDispatcher(drain_interval_seconds=3600)
+        with patch(
+            "lmcache.v1.multiprocess.native_completion._lmc_ops"
+            ".drain_recorded_completions",
+            return_value=[],
+        ):
+            dispatcher.drain_now()  # must not raise
+        assert dispatcher.dispatched_count() == 0
 
 
 @native_only
