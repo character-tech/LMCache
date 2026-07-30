@@ -44,7 +44,7 @@ class VLLM_Detector(EngineDetector):
                 fused_dim = t.shape[3]
                 if fused_dim % 2 != 0:
                     raise ValueError(
-                        f"blocks-first fused trailing dim {fused_dim} is not 2 * head_size"
+                        f"fused trailing dim {fused_dim} is not 2 * head_size"
                     )
                 split.append(t.reshape(*t.shape[:3], 2, fused_dim // 2))
             return lmc_ops.EngineKVFormat.NL_X_NB_NH_BS_TWO_HS, split
