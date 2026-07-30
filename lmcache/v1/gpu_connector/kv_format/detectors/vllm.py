@@ -30,13 +30,9 @@ class VLLM_Detector(EngineDetector):
         # with flash-infer when num_heads == 2). Split [NB, NH, BS, 2*HS] into
         # [NB, NH, BS, 2, HS].
         #
-        # Hybrid models (e.g. google/gemma-4-E4B-it) interleave sliding-window
-        # and full-attention layers with different head configs (observed:
-        # SWA layers [NB, 16, 16, 512] vs full-attention layers
-        # [NB, 4, 32, 1024] - same total per-block bytes, different head
-        # count/head_size split), so the fused trailing dim is per-tensor, not
-        # uniform across the whole model. Derive it from each tensor's own
-        # shape rather than assuming every tensor matches kv_caches[0].
+        # Hybrid models (e.g. google/gemma-4-E4B-it) mix SWA and full-attention
+        # layers with different head configs, so fused_dim is per-tensor, not
+        # uniform across the model.
         if (
             isinstance(kv_caches, list)
             and kv_caches

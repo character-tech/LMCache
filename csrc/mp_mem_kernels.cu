@@ -69,11 +69,8 @@ __device__ inline size_t calculate_engine_global_offset(
            engine_block_idx * shape_desc.kv_size * scalars_per_block *
                shape_desc.nl;
   } else if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS) {
-    // vLLM blocks-first fused K/V (HND): L tensors [NB, NH, BS, 2, HS]. The
-    // K/V axis sits between token and head_size within each block (not a
-    // separate leading axis like the other HND formats above), so k_or_v
-    // does not shift the block-level offset here -- it is folded into
-    // calculate_engine_local_offset below instead.
+    // vLLM blocks-first fused K/V (HND): L tensors [NB, NH, BS, 2, HS]. K/V
+    // is folded into the local offset below, not the block offset.
     return engine_block_idx * shape_desc.kv_size * scalars_per_block;
   }
 }
@@ -89,7 +86,7 @@ __device__ inline size_t calculate_engine_local_offset(
   size_t scalars_per_head = shape_desc.scalars_per_head<ScalarType>();
   size_t scalars_per_token = shape_desc.scalars_per_token<ScalarType>();
   if constexpr (format == EngineKVFormat::NL_X_NB_NH_BS_TWO_HS) {
-    // HND with K/V fused between token and head_size: [NH, BS, 2, HS].
+    // HND, K/V fused: [NH, BS, 2, HS].
     size_t scalars_per_head_block =
         shape_desc.kv_size * shape_desc.bs * scalars_per_head;  // BS * 2 * HS
     return head_idx * scalars_per_head_block +
