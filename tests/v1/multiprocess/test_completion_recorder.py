@@ -3,9 +3,9 @@
 """Tests for the C++ CompletionRecorder and DeviceHostFuncDispatcher."""
 
 # Standard
+from unittest.mock import patch
 import threading
 import time
-from unittest.mock import patch
 
 # Third Party
 import msgspec
