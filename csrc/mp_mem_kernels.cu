@@ -184,7 +184,6 @@ __device__ void multi_layer_block_transfer_single_block(
     const int lmcache_chunk_size  // e.g., 256, used to calculate global offset
                                   // in LMCache object
 ) {
-  const int head_idx = threadIdx.y;
   const int k_or_v = blockIdx.x;
   const int layer_idx = blockIdx.z;
 
@@ -213,23 +212,29 @@ __device__ void multi_layer_block_transfer_single_block(
     paged_buffer_layer_ptr = (ScalarType*)paged_buffer_ptrs[layer_idx];
   }
 
-  for (int token_offset = 0; token_offset < shape_desc.bs; ++token_offset) {
-    const size_t engine_local_offset =
-        calculate_engine_local_offset<ScalarType, format>(
-            token_offset, head_idx, shape_desc, k_or_v);
-    const size_t lmcache_local_offset =
-        calculate_lmcache_local_offset<ScalarType, format>(
-            token_offset, head_idx, shape_desc);
-    ScalarType* engine_ptr =
-        paged_buffer_layer_ptr + engine_global_offset + engine_local_offset;
-    ScalarType* lmcache_ptr =
-        lmcache_object + lmcache_global_offset + lmcache_local_offset;
-    if constexpr (lmcache_to_engine) {
-      warp_copy<ScalarType>(engine_ptr, lmcache_ptr,
-                            shape_desc.scalars_per_head<ScalarType>());
-    } else {
-      warp_copy<ScalarType>(lmcache_ptr, engine_ptr,
-                            shape_desc.scalars_per_head<ScalarType>());
+  // blockDim.y is capped below the hardware 1024-threads-per-block limit, so
+  // nh can exceed it (e.g. Gemma-4 full-attention groups, nh=64) -- loop to
+  // cover the remaining heads.
+  for (int head_idx = threadIdx.y; head_idx < shape_desc.nh;
+       head_idx += blockDim.y) {
+    for (int token_offset = 0; token_offset < shape_desc.bs; ++token_offset) {
+      const size_t engine_local_offset =
+          calculate_engine_local_offset<ScalarType, format>(
+              token_offset, head_idx, shape_desc, k_or_v);
+      const size_t lmcache_local_offset =
+          calculate_lmcache_local_offset<ScalarType, format>(
+              token_offset, head_idx, shape_desc);
+      ScalarType* engine_ptr =
+          paged_buffer_layer_ptr + engine_global_offset + engine_local_offset;
+      ScalarType* lmcache_ptr =
+          lmcache_object + lmcache_global_offset + lmcache_local_offset;
+      if constexpr (lmcache_to_engine) {
+        warp_copy<ScalarType>(engine_ptr, lmcache_ptr,
+                              shape_desc.scalars_per_head<ScalarType>());
+      } else {
+        warp_copy<ScalarType>(lmcache_ptr, engine_ptr,
+                              shape_desc.scalars_per_head<ScalarType>());
+      }
     }
   }
 }
@@ -357,7 +362,11 @@ void multi_layer_block_kv_transfer_templated(
   int elements_per_head = shape_desc.hs * shape_desc.element_size /
                           static_cast<int>(sizeof(ScalarType));
   int thread_dim_x = std::min(elements_per_head, 32);
-  int thread_dim_y = shape_desc.nh;
+  // Cap thread_dim_y so thread_dim_x * thread_dim_y stays within the
+  // hardware 1024-threads-per-block limit; nh can exceed it (e.g. nh=64).
+  constexpr int kMaxThreadsPerBlock = 1024;
+  int thread_dim_y =
+      std::min(shape_desc.nh, kMaxThreadsPerBlock / thread_dim_x);
 
   dim3 block(thread_dim_x, thread_dim_y);
   dim3 grid(shape_desc.kv_size, total_blocks, shape_desc.nl);
