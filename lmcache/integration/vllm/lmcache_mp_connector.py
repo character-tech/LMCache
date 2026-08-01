@@ -168,11 +168,13 @@ class LMCacheMPRequestState(enum.Enum):
     """
     State machine:
     PREFETCHING -- update_state_after_alloc --> WAITING_FOR_LOAD
-    WAITING_FOR_LOAD -- process_loading_requests --> READY
+    WAITING_FOR_LOAD -- process_loading_requests --> LOADING
+    LOADING -- finished_recving --> READY
     """
 
     PREFETCHING = enum.auto()
     WAITING_FOR_LOAD = enum.auto()
+    LOADING = enum.auto()
     READY = enum.auto()
 
 
@@ -466,6 +468,7 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         super().__init__()
         self.requests: list[LMCacheMPRequestMetadata] = []
+        self.aborted_retrieve_req_ids: set[str] = set()
 
     def add_request_metadata(self, request_metadata: LMCacheMPRequestMetadata):
         self.requests.append(request_metadata)
@@ -594,6 +597,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 extra_config=vllm_config.kv_transfer_config.kv_connector_extra_config,
             )
             self.request_trackers: dict[str, LMCacheMPRequestTracker] = {}
+            self._aborted_retrieve_req_ids: set[str] = set()
         elif self.role == KVConnectorRole.WORKER:
             # Node routing: a worker connects only to its local LMCache server.
             # Global ranks are assigned to nodes in contiguous blocks:
@@ -715,6 +719,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
+        self.worker_adapter.mark_aborted_retrieves(
+            metadata.aborted_retrieve_req_ids
+        )
 
         request_ids = []
         ops = []
@@ -1035,6 +1042,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             scheduler_output (SchedulerOutput): the scheduler output object.
         """
         metadata = LMCacheMPConnectorMetadata()
+        metadata.aborted_retrieve_req_ids = self._aborted_retrieve_req_ids
+        self._aborted_retrieve_req_ids = set()
 
         self._process_retrieve_requests(metadata)
         self._process_new_requests(scheduler_output, metadata)
@@ -1056,7 +1065,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             connector_output (KVConnectorOutput): the worker-side
                 connectors output.
         """
-        return
+        for request_id in connector_output.finished_recving or ():
+            tracker = self.request_trackers.get(request_id)
+            if tracker is not None and tracker.state == LMCacheMPRequestState.LOADING:
+                tracker.state = LMCacheMPRequestState.READY
 
     def request_finished(
         self,
@@ -1078,6 +1090,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             returned by the engine.
         """
 
+        tracker = self.request_trackers.get(request.request_id)
+        load_in_flight = (
+            tracker is not None and tracker.state == LMCacheMPRequestState.LOADING
+        )
+        if load_in_flight:
+            self._aborted_retrieve_req_ids.add(request.request_id)
+
         params: dict[str, Any] | None = getattr(request, "kv_transfer_params", None)
         return_params: dict[str, Any] | None = {} if params is not None else None
 
@@ -1086,9 +1105,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             and return_params is not None
             and "cached_token_stats" in params
         ):
-            request_tracker = self._get_request_tracker(request.request_id)
-            num_vllm = request_tracker.num_vllm_hit_tokens
-            num_lmcache = request_tracker.num_lmcache_hit_tokens
+            assert tracker is not None
+            num_vllm = tracker.num_vllm_hit_tokens
+            num_lmcache = tracker.num_lmcache_hit_tokens
             return_params["cached_token_stats"] = {
                 "num_vllm_cached_tokens": num_vllm,
                 "num_lmcache_cached_tokens": num_lmcache,
@@ -1100,7 +1119,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # Notify LMCache to end the session for this request
         self.scheduler_adapter.end_session(request.request_id)
 
-        return True, return_params
+        return not load_in_flight, (return_params or None)
 
     def request_finished_all_groups(
         self,
@@ -1194,7 +1213,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
-            request_tracker.state = LMCacheMPRequestState.READY
+                request_tracker.state = LMCacheMPRequestState.LOADING
+            else:
+                request_tracker.state = LMCacheMPRequestState.READY
 
     def _process_new_requests(
         self,
@@ -1209,6 +1230,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
+            if request_tracker.state == LMCacheMPRequestState.LOADING:
+                continue
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
                 lmcache_tokens_per_chunk,
@@ -1238,6 +1261,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             num_new_tokens = scheduler_output.num_scheduled_tokens[request_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
 
+            if request_tracker.state == LMCacheMPRequestState.LOADING:
+                continue
             r_meta = LMCacheMPRequestMetadata.GetStoreMetadata(
                 request_tracker,
                 lmcache_tokens_per_chunk,
