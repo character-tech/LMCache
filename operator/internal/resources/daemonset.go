@@ -265,6 +265,7 @@ func buildDaemonSetCore(
 					Affinity:           spec.Affinity,
 					Tolerations:        spec.Tolerations,
 					ImagePullSecrets:   spec.ImagePullSecrets,
+					InitContainers:     spec.InitContainers,
 					Containers: []corev1.Container{
 						{
 							Name:            "lmcache",
