@@ -17,6 +17,11 @@ from lmcache.v1.distributed.serde.fp8 import (
     Fp8QuantizationDeserializer,
     Fp8QuantizationSerializer,
 )
+from lmcache.v1.distributed.serde.gemma4_cachegen import (
+    CacheGenFp8GroupCodec,
+    Gemma4CacheGenDeserializer,
+    Gemma4CacheGenSerializer,
+)
 from lmcache.v1.distributed.serde.multi import (
     LayoutDescGroup,
     MemoryObjGroup,
@@ -36,6 +41,9 @@ __all__ = [
     "Deserializer",
     "Fp8QuantizationDeserializer",
     "Fp8QuantizationSerializer",
+    "CacheGenFp8GroupCodec",
+    "Gemma4CacheGenDeserializer",
+    "Gemma4CacheGenSerializer",
     "LayoutDescGroup",
     "MemoryObjGroup",
     "MultiDeserializer",
