@@ -479,13 +479,10 @@ class LookupModule:
                     "found_count": found_count,
                     "requested_tokens": job.requested_tokens,
                     "hit_tokens": found_count * self._ctx.chunk_size,
-                    "hit_tokens_l1_resident": l1_hit_chunks
-                    * self._ctx.chunk_size,
+                    "hit_tokens_l1_resident": l1_hit_chunks * self._ctx.chunk_size,
                     "hit_tokens_l2_loaded": l2_hit_chunks * self._ctx.chunk_size,
-                    "serve_tokens_l1_resident": serve_l1_chunks
-                    * self._ctx.chunk_size,
-                    "serve_tokens_l2_loaded": serve_l2_chunks
-                    * self._ctx.chunk_size,
+                    "serve_tokens_l1_resident": serve_l1_chunks * self._ctx.chunk_size,
+                    "serve_tokens_l2_loaded": serve_l2_chunks * self._ctx.chunk_size,
                     "model_name": job.model_name,
                     "cache_salt": job.cache_salt,
                 },
