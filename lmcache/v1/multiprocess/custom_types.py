@@ -60,6 +60,14 @@ class IPCCacheServerKey:
     # ObjectKey.cache_salt). Validated in __post_init__.
     cache_salt: str = ""
 
+    # === GPU-native hit at lookup time (not part of cache identity) ===
+    # vLLM's local prefix-cache hit tokens at submission.  Lets serving
+    # metrics attribute the found prefix beyond the native hit to
+    # L1-resident vs L2-loaded chunks (see LookupModule).  Old payloads
+    # decode with the default 0 — same wire-compat pattern as
+    # ``cache_salt`` above.
+    native_hit_tokens: int = field(default=0, compare=False)
+
     # Duplicated from ObjectKey — cannot import ObjectKey here due to
     # circular dependency (api.py imports IPCCacheServerKey).
     _SALT_FORBIDDEN_CHARS = frozenset("@/\\\x00")
@@ -113,6 +121,7 @@ class IPCCacheServerKey:
             end=self.end,
             request_id=self.request_id,
             cache_salt=self.cache_salt,
+            native_hit_tokens=self.native_hit_tokens,
         )
 
 

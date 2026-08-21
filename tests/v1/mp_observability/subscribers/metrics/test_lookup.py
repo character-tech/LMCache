@@ -358,3 +358,60 @@ class TestLookupAttributeLabels:
             after.get(req, {}).get(empty_key, 0)
             == before.get(req, {}).get(empty_key, 0) + 128
         )
+
+
+# ---------------------------------------------------------------------------
+# L1/L2 attribution counters
+# ---------------------------------------------------------------------------
+
+
+class TestAttributionCounters:
+    def test_split_counters(self, bus, subscriber, snapshot):
+        """Presence and serve splits land in their dedicated counters."""
+        bus.start()
+        bus.publish(
+            Event(
+                event_type=EventType.MP_LOOKUP_PREFETCH_END,
+                session_id="req-attr-1",
+                metadata={
+                    "found_count": 4,
+                    "requested_tokens": 2048,
+                    "hit_tokens": 1024,
+                    "hit_tokens_l1_resident": 768,
+                    "hit_tokens_l2_loaded": 256,
+                    "serve_tokens_l1_resident": 512,
+                    "serve_tokens_l2_loaded": 256,
+                },
+            )
+        )
+        time.sleep(_DRAIN_WAIT)
+        bus.stop()
+
+        delta = snapshot()
+        assert delta["lmcache_mp.lookup_hit_l1_resident"] == 768
+        assert delta["lmcache_mp.lookup_hit_l2_loaded"] == 256
+        assert delta["lmcache_mp.serve_l1_resident"] == 512
+        assert delta["lmcache_mp.serve_l2_loaded"] == 256
+
+    def test_missing_split_fields_are_tolerated(self, bus, subscriber, snapshot):
+        """Events from emitters without the split fields move nothing."""
+        bus.start()
+        bus.publish(
+            Event(
+                event_type=EventType.MP_LOOKUP_PREFETCH_END,
+                session_id="req-attr-2",
+                metadata={
+                    "found_count": 4,
+                    "requested_tokens": 1024,
+                    "hit_tokens": 1024,
+                },
+            )
+        )
+        time.sleep(_DRAIN_WAIT)
+        bus.stop()
+
+        delta = snapshot()
+        assert delta.get("lmcache_mp.lookup_hit_l1_resident", 0) == 0
+        assert delta.get("lmcache_mp.lookup_hit_l2_loaded", 0) == 0
+        assert delta.get("lmcache_mp.serve_l1_resident", 0) == 0
+        assert delta.get("lmcache_mp.serve_l2_loaded", 0) == 0

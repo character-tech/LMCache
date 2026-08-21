@@ -81,6 +81,42 @@ class LookupMetricsSubscriber(EventSubscriber):
             ),
             unit="tokens",
         )
+        self._hit_l1_resident_tokens = meter.create_counter(
+            "lmcache_mp.lookup_hit_l1_resident",
+            description=(
+                "Of lookup_hit: tokens whose chunks were fully resident "
+                "in L1 at submission (presence attribution)."
+            ),
+            unit="tokens",
+        )
+        self._hit_l2_loaded_tokens = meter.create_counter(
+            "lmcache_mp.lookup_hit_l2_loaded",
+            description=(
+                "Of lookup_hit: tokens whose chunks required the L2 "
+                "pipeline (presence attribution)."
+            ),
+            unit="tokens",
+        )
+        self._serve_l1_resident_tokens = meter.create_counter(
+            "lmcache_mp.serve_l1_resident",
+            description=(
+                "Tokens beyond vLLM's GPU-native prefix hit served from "
+                "L1-resident chunks (serve attribution). Requires clients "
+                "that send native_hit_tokens; otherwise equals "
+                "lookup_hit_l1_resident."
+            ),
+            unit="tokens",
+        )
+        self._serve_l2_loaded_tokens = meter.create_counter(
+            "lmcache_mp.serve_l2_loaded",
+            description=(
+                "Tokens beyond vLLM's GPU-native prefix hit that required "
+                "an L2 load (serve attribution). Requires clients that "
+                "send native_hit_tokens; otherwise equals "
+                "lookup_hit_l2_loaded."
+            ),
+            unit="tokens",
+        )
 
     def get_subscriptions(self) -> dict[EventType, EventCallback]:
         return {
@@ -91,3 +127,17 @@ class LookupMetricsSubscriber(EventSubscriber):
         attrs = _lookup_attrs(event)
         self._requested_tokens.add(event.metadata["requested_tokens"], attributes=attrs)
         self._hit_tokens.add(event.metadata["hit_tokens"], attributes=attrs)
+        # .get(): events from emitters predating the L1/L2 attribution
+        # fields simply do not move the split counters.
+        self._hit_l1_resident_tokens.add(
+            event.metadata.get("hit_tokens_l1_resident", 0), attributes=attrs
+        )
+        self._hit_l2_loaded_tokens.add(
+            event.metadata.get("hit_tokens_l2_loaded", 0), attributes=attrs
+        )
+        self._serve_l1_resident_tokens.add(
+            event.metadata.get("serve_tokens_l1_resident", 0), attributes=attrs
+        )
+        self._serve_l2_loaded_tokens.add(
+            event.metadata.get("serve_tokens_l2_loaded", 0), attributes=attrs
+        )

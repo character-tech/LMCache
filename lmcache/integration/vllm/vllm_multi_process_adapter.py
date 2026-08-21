@@ -702,6 +702,7 @@ class LMCacheMPSchedulerAdapter:
         request_id: str,
         token_ids: list[int],
         cache_salt: str = "",
+        native_hit_tokens: int = 0,
     ):
         """
         Submit a new lookup request to LMCache if there is no ongoing request.
@@ -716,6 +717,10 @@ class LMCacheMPSchedulerAdapter:
             token_ids: Token IDs to lookup from LMCache
             cache_salt: Per-user isolation salt. Requests with different
                 cache_salt values produce separate cache entries.
+            native_hit_tokens: vLLM's GPU-native prefix-cache hit token
+                count for this request, used server-side to attribute the
+                served (beyond-native) portion of the hit to L1-resident
+                vs L2-loaded chunks. 0 when unknown.
 
         Returns:
             None
@@ -746,6 +751,7 @@ class LMCacheMPSchedulerAdapter:
             end=aligned_end,
             request_id=request_id,
             cache_salt=cache_salt,
+            native_hit_tokens=native_hit_tokens,
         ).no_worker_id_version()
 
         futures: dict[str, MessagingFuture[Any]] = {
@@ -1010,6 +1016,7 @@ class LMCacheMPSchedulerAdapter:
         end: int,
         request_id: str,
         cache_salt: str = "",
+        native_hit_tokens: int = 0,
     ) -> IPCCacheServerKey:
         """Convert token IDs to an IPC cache engine key.
 
@@ -1034,6 +1041,7 @@ class LMCacheMPSchedulerAdapter:
             end=end,
             request_id=request_id,
             cache_salt=cache_salt,
+            native_hit_tokens=native_hit_tokens,
         )
 
 
@@ -1753,6 +1761,7 @@ class LMCacheMPWorkerAdapter:
         end: int,
         request_id: str,
         cache_salt: str = "",
+        native_hit_tokens: int = 0,
     ) -> IPCCacheServerKey:
         """Convert token IDs to an IPC cache engine key.
 

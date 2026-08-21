@@ -912,6 +912,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             request.request_id,
             token_ids=list(request.all_token_ids),
             cache_salt=tracker.cache_salt,
+            native_hit_tokens=num_computed_tokens,
         )
 
         ret = self.scheduler_adapter.check_lookup_result(request.request_id)

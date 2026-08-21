@@ -105,6 +105,56 @@ def _get_prefix_hit_length(
     return found_prefix_len // (world_size * num_object_groups)
 
 
+def _attribute_hit_chunks(
+    found_leading_keys: int,
+    l1_found_indices: tuple[int, ...],
+    native_hit_tokens: int,
+    chunk_size: int,
+    keys_per_chunk: int,
+) -> tuple[int, int, int, int]:
+    """Split a lookup hit into (l1_hit, l2_hit, serve_l1, serve_l2) chunks.
+
+    ``l1_hit``/``l2_hit`` split the whole found prefix by where each chunk
+    was at submission time (presence attribution).  ``serve_l1``/``serve_l2``
+    split only the portion beyond vLLM's GPU-native prefix hit — the chunks
+    a retrieve will actually deliver (serve attribution).
+
+    A chunk counts as L1-resident only when ALL of its keys were found in
+    L1 at submission; partially-resident chunks attribute to L2, since
+    completing them requires the L2 pipeline.
+
+    Args:
+        found_leading_keys: ``found.count_leading_ones()`` from the
+            completed prefetch bitmap (contiguous found-key prefix).
+        l1_found_indices: Original-key indices read-locked in L1 at
+            submission time (``PrefetchHandle.l1_found_indices``).
+        native_hit_tokens: vLLM's GPU-native prefix hit for the request;
+            0 when unknown (older clients), which makes serve == hit.
+        chunk_size: Tokens per chunk.
+        keys_per_chunk: ``world_size * num_object_groups``.
+
+    Returns:
+        Tuple of chunk counts:
+        ``(l1_hit_chunks, l2_hit_chunks, serve_l1_chunks, serve_l2_chunks)``.
+    """
+    if keys_per_chunk <= 0 or chunk_size <= 0:
+        return 0, 0, 0, 0
+    found_chunks = found_leading_keys // keys_per_chunk
+    if found_chunks == 0:
+        return 0, 0, 0, 0
+    resident = set(l1_found_indices)
+    l1_flags = [
+        all((c * keys_per_chunk + k) in resident for k in range(keys_per_chunk))
+        for c in range(found_chunks)
+    ]
+    l1_hit = sum(l1_flags)
+    l2_hit = found_chunks - l1_hit
+    native_chunks = min(native_hit_tokens // chunk_size, found_chunks)
+    serve_l1 = sum(l1_flags[native_chunks:])
+    serve_l2 = (found_chunks - native_chunks) - serve_l1
+    return l1_hit, l2_hit, serve_l1, serve_l2
+
+
 @dataclass
 class _PrefetchJob:
     handle: PrefetchHandle
@@ -123,6 +173,10 @@ class _PrefetchJob:
     # tenant / isolation domain (an empty string means no salt set).
     model_name: str = ""
     cache_salt: str = ""
+    # vLLM's GPU-native prefix hit (tokens) at lookup submission; used
+    # for L1/L2 serve attribution at ``MP_LOOKUP_PREFETCH_END``.  0 when
+    # the client did not supply it.
+    native_hit_tokens: int = 0
 
 
 class LookupModule:
@@ -333,6 +387,7 @@ class LookupModule:
                 num_object_groups=attn_desc.num_object_groups,
                 model_name=model_name,
                 cache_salt=key.cache_salt,
+                native_hit_tokens=key.native_hit_tokens,
             )
         )
 
@@ -406,6 +461,16 @@ class LookupModule:
             found.count_leading_ones(), job.world_size, job.num_object_groups
         )
 
+        l1_hit_chunks, l2_hit_chunks, serve_l1_chunks, serve_l2_chunks = (
+            _attribute_hit_chunks(
+                found.count_leading_ones(),
+                job.handle.l1_found_indices,
+                job.native_hit_tokens,
+                self._ctx.chunk_size,
+                job.world_size * job.num_object_groups,
+            )
+        )
+
         self._ctx.event_bus.publish(
             Event(
                 event_type=EventType.MP_LOOKUP_PREFETCH_END,
@@ -414,6 +479,13 @@ class LookupModule:
                     "found_count": found_count,
                     "requested_tokens": job.requested_tokens,
                     "hit_tokens": found_count * self._ctx.chunk_size,
+                    "hit_tokens_l1_resident": l1_hit_chunks
+                    * self._ctx.chunk_size,
+                    "hit_tokens_l2_loaded": l2_hit_chunks * self._ctx.chunk_size,
+                    "serve_tokens_l1_resident": serve_l1_chunks
+                    * self._ctx.chunk_size,
+                    "serve_tokens_l2_loaded": serve_l2_chunks
+                    * self._ctx.chunk_size,
                     "model_name": job.model_name,
                     "cache_salt": job.cache_salt,
                 },
