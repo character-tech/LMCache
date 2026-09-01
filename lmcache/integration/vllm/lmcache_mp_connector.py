@@ -719,9 +719,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         metadata = self._get_connector_metadata()
         assert isinstance(metadata, LMCacheMPConnectorMetadata)
-        self.worker_adapter.mark_aborted_retrieves(
-            metadata.aborted_retrieve_req_ids
-        )
+        self.worker_adapter.mark_aborted_retrieves(metadata.aborted_retrieve_req_ids)
 
         request_ids = []
         ops = []
