@@ -137,6 +137,7 @@ class StorageManager:
             l2_adapters=list(self._l2_adapters.values()),
             adapter_descriptors=list(self._adapter_descriptors.values()),
             policy=create_store_policy(config.store_policy),
+            max_inflight_tasks=config.store_max_inflight_tasks,
         )
         self._store_controller.start()
 

@@ -40,6 +40,7 @@ class EventType(Enum):
     # L2 Store Controller events
     L2_STORE_SUBMITTED = "l2.store.submitted"
     L2_STORE_COMPLETED = "l2.store.completed"
+    L2_STORE_DROPPED = "l2.store.dropped"
 
     # L2 Prefetch Controller events
     L2_PREFETCH_LOOKUP_SUBMITTED = "l2.prefetch.lookup.submitted"

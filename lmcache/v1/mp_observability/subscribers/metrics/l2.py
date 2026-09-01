@@ -75,6 +75,14 @@ class L2MetricsSubscriber(EventSubscriber):
             description="Total chunks successfully stored to L2",
             unit="chunks",
         )
+        self._store_dropped_objects = meter.create_counter(
+            "lmcache_mp.l2_store_dropped_objects",
+            description=(
+                "Total chunks shed from L2 store because the in-flight "
+                "store cap was reached (not offloaded to L2)"
+            ),
+            unit="chunks",
+        )
 
         # Per-adapter load task counter (for IOPS via rate()).
         # Labeled by ``l2_name`` so dashboards can slice per backend.
@@ -129,6 +137,7 @@ class L2MetricsSubscriber(EventSubscriber):
         return {
             EventType.L2_STORE_SUBMITTED: self._on_store_submitted,
             EventType.L2_STORE_COMPLETED: self._on_store_completed,
+            EventType.L2_STORE_DROPPED: self._on_store_dropped,
             EventType.L2_LOAD_TASK_COMPLETED: self._on_load_task_completed,
             EventType.L2_PREFETCH_LOOKUP_SUBMITTED: self._on_lookup_submitted,
             EventType.L2_PREFETCH_LOOKUP_COMPLETED: self._on_lookup_completed,
@@ -149,6 +158,12 @@ class L2MetricsSubscriber(EventSubscriber):
         self._store_completed.add(1, attributes=attrs)
         emit_salt_counts(
             self._store_completed_objects,
+            event.metadata.get("key_count_per_salt", {}),
+        )
+
+    def _on_store_dropped(self, event: Event) -> None:
+        emit_salt_counts(
+            self._store_dropped_objects,
             event.metadata.get("key_count_per_salt", {}),
         )
 

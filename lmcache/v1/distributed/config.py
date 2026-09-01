@@ -247,6 +247,18 @@ class StorageManagerConfig:
     prefetch_max_in_flight: int = 8
     """ Maximum number of concurrent prefetch requests. """
 
+    store_max_inflight_tasks: int = 0
+    """ Maximum number of concurrent in-flight L2 store tasks. Each in-flight
+    store holds an L1 read lock on its source block until the L2 write
+    completes, keeping that block pinned (non-evictable). Under sustained
+    write backpressure (e.g. a slow storage tier) unbounded in-flight stores
+    can pin enough of L1 that eviction stalls and the cache tier saturates.
+    When the number of in-flight store tasks is at or above this cap, newly
+    written keys are shed (not stored to L2) rather than queued, so their
+    blocks are never read-locked and stay immediately evictable. A shed store
+    is best-effort: the KV is simply not offloaded to L2 and is recomputed on
+    the next miss. ``0`` disables the cap (unbounded, legacy behavior). """
+
     periodic_notifier_interval_ms: int = 5
     """ Interval (ms) for the periodic event notifier heartbeat. """
 
@@ -508,6 +520,20 @@ def add_storage_manager_args(
         help="Maximum number of concurrent prefetch requests. Default is 8.",
     )
     policy_group.add_argument(
+        "--l2-store-max-inflight-tasks",
+        type=int,
+        default=0,
+        help=(
+            "Maximum number of concurrent in-flight L2 store tasks. Each "
+            "in-flight store pins its L1 source block (read-locked, "
+            "non-evictable) until the L2 write completes; unbounded stores "
+            "under write backpressure can pin enough of L1 that eviction "
+            "stalls. At the cap, newly written keys are shed (not stored, "
+            "recomputed on the next miss) so their blocks stay evictable. "
+            "0 disables the cap (unbounded). Default is 0."
+        ),
+    )
+    policy_group.add_argument(
         "--periodic-notifier-interval-ms",
         type=int,
         default=5,
@@ -599,6 +625,7 @@ def parse_args_to_config(
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
+        store_max_inflight_tasks=args.l2_store_max_inflight_tasks,
         periodic_notifier_interval_ms=args.periodic_notifier_interval_ms,
     )
     return config

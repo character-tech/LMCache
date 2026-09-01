@@ -229,8 +229,16 @@ class StoreController(StorageControllerInterface):
         l2_adapters: list[L2AdapterInterface],
         adapter_descriptors: list[AdapterDescriptor],
         policy: StorePolicy,
+        max_inflight_tasks: int = 0,
     ) -> None:
         self._l1_manager = l1_manager
+        # Cap on concurrent in-flight L2 store tasks. Each in-flight store
+        # holds an L1 read lock on its source block until the L2 write
+        # completes, pinning that block. When the number of in-flight tasks
+        # is at or above this cap, newly written keys are shed (not stored,
+        # never read-locked) so their blocks stay evictable and L1 cannot be
+        # saturated by pending stores. ``0`` disables the cap (unbounded).
+        self._max_inflight_tasks = int(max_inflight_tasks)
         self._l2_adapters: dict[int, L2AdapterInterface] = {
             desc.index: adapter
             for desc, adapter in zip(adapter_descriptors, l2_adapters, strict=True)
@@ -261,6 +269,10 @@ class StoreController(StorageControllerInterface):
 
         # Shadow counter for status reporting (updated in background loop)
         self._status_in_flight_count: int = 0
+
+        # Monotonic count of store tasks shed because the in-flight cap was
+        # reached (updated in the background loop; reporting only).
+        self._status_dropped_count: int = 0
 
         StoreController._gauge_target = self
         if not StoreController._gauge_registered:
@@ -329,6 +341,8 @@ class StoreController(StorageControllerInterface):
             "thread_alive": is_healthy,
             "pending_keys_count": self._listener.pending_count(),
             "in_flight_task_count": self._status_in_flight_count,
+            "max_inflight_tasks": self._max_inflight_tasks,
+            "dropped_task_keys_total": self._status_dropped_count,
             "num_l2_adapters": len(self._l2_adapters),
             "num_active_adapters": len(self._l2_adapters) - num_draining,
             "num_draining_adapters": num_draining,
@@ -593,6 +607,48 @@ class StoreController(StorageControllerInterface):
                     "StorePolicy returned invalid adapter id %d "
                     "(not among attached adapters). Skipping.",
                     adapter_index,
+                )
+                continue
+
+            # In-flight store cap: shed this group when at/over the cap.
+            #
+            # The check is placed BEFORE reserve_read so a shed group is
+            # never read-locked in L1 -- its blocks stay immediately
+            # evictable and there is no partial state to unwind (nothing was
+            # reserved). Gating on ``len(self._in_flight_tasks)`` (the ground
+            # truth, updated on submit and completion) rather than a shadow
+            # counter avoids drift. The store loop is single-threaded, so
+            # this read is race-free. A shed store is best-effort: the KV is
+            # not offloaded to L2 and is recomputed on the next miss. ``0``
+            # disables the cap (unbounded, legacy behavior).
+            if (
+                self._max_inflight_tasks > 0
+                and len(self._in_flight_tasks) >= self._max_inflight_tasks
+            ):
+                self._status_dropped_count += len(target_keys)
+                self._event_bus.publish(
+                    Event(
+                        event_type=EventType.L2_STORE_DROPPED,
+                        metadata={
+                            "adapter_index": adapter_index,
+                            "l2_name": self._adapter_descriptors[
+                                adapter_index
+                            ].type_name,
+                            "reason": "inflight_cap",
+                            "key_count": len(target_keys),
+                            "inflight_task_count": len(self._in_flight_tasks),
+                            "key_count_per_salt": Counter(
+                                k.cache_salt for k in target_keys
+                            ),
+                        },
+                    )
+                )
+                logger.debug(
+                    "Shedding %d store keys for adapter %d: in-flight store "
+                    "cap %d reached.",
+                    len(target_keys),
+                    adapter_index,
+                    self._max_inflight_tasks,
                 )
                 continue
 
