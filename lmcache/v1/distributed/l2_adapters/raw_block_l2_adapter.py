@@ -91,6 +91,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         num_store_workers: int = 2,
         num_lookup_workers: int = 1,
         num_load_workers: int = 4,
+        max_inflight_read_bytes: int = 0,
+        max_inflight_write_bytes: int = 0,
     ):
         """Initialize raw-block MP adapter configuration.
 
@@ -117,6 +119,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             num_store_workers: Number of store worker threads.
             num_lookup_workers: Number of lookup worker threads.
             num_load_workers: Number of load worker threads.
+            max_inflight_read_bytes: Pacing window for concurrent device reads.
+            max_inflight_write_bytes: Pacing window for concurrent device writes.
         """
         super().__init__()
         self.device_path = device_path
@@ -138,12 +142,16 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
         self.iouring_queue_depth = int(iouring_queue_depth)
         validate_raw_block_io_options(
             iouring_queue_depth=self.iouring_queue_depth,
+            max_inflight_read_bytes=int(max_inflight_read_bytes),
+            max_inflight_write_bytes=int(max_inflight_write_bytes),
         )
         self.use_uring_cmd = bool(use_uring_cmd)
         self.max_data_transfer_size = int(max_data_transfer_size)
         self.num_store_workers = int(num_store_workers)
         self.num_lookup_workers = int(num_lookup_workers)
         self.num_load_workers = int(num_load_workers)
+        self.max_inflight_read_bytes = int(max_inflight_read_bytes)
+        self.max_inflight_write_bytes = int(max_inflight_write_bytes)
 
     @classmethod
     def from_dict(cls, d: dict) -> "RawBlockL2AdapterConfig":
@@ -189,8 +197,12 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             raise ValueError("slot_bytes must be >= header_bytes + 1")
         if capacity_bytes > 0 and capacity_bytes <= meta_total_bytes:
             raise ValueError("capacity_bytes must leave space for at least one slot")
+        max_inflight_read_bytes = int(d.get("max_inflight_read_bytes", 0))
+        max_inflight_write_bytes = int(d.get("max_inflight_write_bytes", 0))
         validate_raw_block_io_options(
             iouring_queue_depth=iouring_queue_depth,
+            max_inflight_read_bytes=max_inflight_read_bytes,
+            max_inflight_write_bytes=max_inflight_write_bytes,
         )
         if use_uring_cmd and io_engine != "io_uring":
             raise ValueError("use_uring_cmd requires io_uring io_engine")
@@ -230,6 +242,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             num_store_workers=worker_counts["num_store_workers"],
             num_lookup_workers=worker_counts["num_lookup_workers"],
             num_load_workers=worker_counts["num_load_workers"],
+            max_inflight_read_bytes=max_inflight_read_bytes,
+            max_inflight_write_bytes=max_inflight_write_bytes,
         )
 
     @classmethod
@@ -270,7 +284,13 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             "< 0: auto detect limit splitting)\n"
             "- num_store_workers (int): store worker threads (default 2)\n"
             "- num_lookup_workers (int): lookup worker threads (default 1)\n"
-            "- num_load_workers (int): load worker threads (default 4)"
+            "- num_load_workers (int): load worker threads (default 4)\n"
+            "- max_inflight_read_bytes (int): pacing window bounding the bytes "
+            "of concurrently submitted device reads across all worker "
+            "threads (0 disables pacing, default 0)\n"
+            "- max_inflight_write_bytes (int): pacing window bounding the "
+            "bytes of concurrently submitted device writes across all "
+            "worker threads (0 disables pacing, default 0)"
         )
 
     def to_core_config(self) -> RawBlockCoreConfig:
@@ -295,6 +315,8 @@ class RawBlockL2AdapterConfig(L2AdapterConfigBase):
             iouring_queue_depth=self.iouring_queue_depth,
             use_uring_cmd=self.use_uring_cmd,
             max_data_transfer_size=self.max_data_transfer_size,
+            max_inflight_read_bytes=self.max_inflight_read_bytes,
+            max_inflight_write_bytes=self.max_inflight_write_bytes,
         )
 
 

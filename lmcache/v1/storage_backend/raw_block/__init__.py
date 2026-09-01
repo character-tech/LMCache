@@ -4,6 +4,7 @@
 from lmcache.v1.storage_backend.raw_block.core import (
     DEFAULT_IOURING_QUEUE_DEPTH,
     RAW_BLOCK_IO_ENGINES,
+    BoundedBytesLimiter,
     RawBlockCore,
     RawBlockCoreConfig,
     RawBlockPutManyResult,
@@ -23,6 +24,7 @@ from lmcache.v1.storage_backend.raw_block.key_codec import (
 )
 
 __all__ = [
+    "BoundedBytesLimiter",
     "RawBlockCore",
     "RawBlockCoreConfig",
     "RAW_BLOCK_IO_ENGINES",

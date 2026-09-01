@@ -58,6 +58,86 @@ def round_up(x: int, align: int) -> int:
     return ((x + align - 1) // align) * align
 
 
+class BoundedBytesLimiter:
+    """Variable-size semaphore that bounds in-flight I/O bytes.
+
+    Paces device I/O submission across all worker threads sharing one
+    ``RawBlockCore`` (i.e. one process): a caller acquiring ``n`` bytes
+    blocks until at least ``min(n, capacity)`` bytes are available, so the
+    number of concurrently submitted device operations — and therefore this
+    process's contribution to a shared device's queue depth when several
+    processes share the same disk — stays bounded regardless of
+    worker-pool sizes.
+
+    An acquisition larger than ``capacity`` is granted only when the window
+    is completely idle, so a single oversized operation still makes forward
+    progress (and runs alone) instead of deadlocking.
+
+    Not thread-safe for ``capacity <= 0`` callers: construct ``None``
+    instead of a zero-capacity limiter.
+    """
+
+    def __init__(self, capacity_bytes: int) -> None:
+        """Initialize the limiter.
+
+        Args:
+            capacity_bytes: Maximum total bytes granted at once. Must be > 0.
+
+        Raises:
+            ValueError: If ``capacity_bytes`` is not positive.
+        """
+        if capacity_bytes <= 0:
+            raise ValueError("capacity_bytes must be > 0")
+        self._capacity = int(capacity_bytes)
+        self._available = self._capacity
+        self._cond = threading.Condition()
+
+    @property
+    def capacity_bytes(self) -> int:
+        """Return the configured window size in bytes."""
+        return self._capacity
+
+    def available_bytes(self) -> int:
+        """Return the currently ungranted bytes in the window."""
+        with self._cond:
+            return self._available
+
+    def acquire(self, num_bytes: int) -> int:
+        """Wait for and reserve ``num_bytes`` from the window.
+
+        Args:
+            num_bytes: Bytes of I/O the caller is about to submit. Values
+                larger than the capacity are clamped to the capacity so a
+                single oversized operation can proceed when the window is
+                otherwise idle.
+
+        Returns:
+            The number of bytes actually reserved (callers must return this
+            same value to :meth:`release`).
+        """
+        granted = min(int(num_bytes), self._capacity)
+        with self._cond:
+            while self._available < granted:
+                self._cond.wait()
+            self._available -= granted
+        return granted
+
+    def release(self, granted_bytes: int) -> None:
+        """Return previously acquired bytes to the window.
+
+        Args:
+            granted_bytes: Value returned by the matching :meth:`acquire` call.
+        """
+        with self._cond:
+            self._available = min(self._capacity, self._available + int(granted_bytes))
+            self._cond.notify_all()
+
+    def granted_bytes(self) -> int:
+        """Return the number of bytes currently held by callers."""
+        with self._cond:
+            return self._capacity - self._available
+
+
 def normalize_raw_block_io_engine(
     io_engine: Any = None,
     *,
@@ -94,17 +174,25 @@ def normalize_raw_block_io_engine(
 def validate_raw_block_io_options(
     *,
     iouring_queue_depth: int,
+    max_inflight_read_bytes: int = 0,
+    max_inflight_write_bytes: int = 0,
 ) -> None:
     """Validate numeric raw-block I/O engine options.
 
     Args:
         iouring_queue_depth: Queue depth for the Rust io_uring path.
+        max_inflight_read_bytes: In-flight read pacing window (0 disables).
+        max_inflight_write_bytes: In-flight write pacing window (0 disables).
 
     Raises:
         ValueError: If any numeric option is not positive.
     """
     if int(iouring_queue_depth) <= 0:
         raise ValueError("iouring_queue_depth must be > 0")
+    if int(max_inflight_read_bytes) < 0:
+        raise ValueError("max_inflight_read_bytes must be >= 0")
+    if int(max_inflight_write_bytes) < 0:
+        raise ValueError("max_inflight_write_bytes must be >= 0")
 
 
 def _resolve_sysfs_queue_dir(device_path: str) -> Optional[str]:
@@ -149,6 +237,8 @@ class RawBlockCoreConfig:
     io_engine: str = "posix"
     iouring_queue_depth: int = DEFAULT_IOURING_QUEUE_DEPTH
     use_uring_cmd: bool = False
+    max_inflight_read_bytes: int = 0
+    max_inflight_write_bytes: int = 0
 
 
 @dataclass
@@ -222,6 +312,8 @@ class RawBlockCore:
         self.io_engine = normalize_raw_block_io_engine(config.io_engine)
         self.iouring_queue_depth = int(config.iouring_queue_depth)
         self.use_uring_cmd = bool(config.use_uring_cmd)
+        self.max_inflight_read_bytes = int(config.max_inflight_read_bytes)
+        self.max_inflight_write_bytes = int(config.max_inflight_write_bytes)
         if self.use_uring_cmd and self.use_odirect:
             logger.warning(
                 "RawBlockCore: use_odirect is ignored for NVMe namespace "
@@ -252,6 +344,8 @@ class RawBlockCore:
             raise ValueError("meta_version must be > 0")
         validate_raw_block_io_options(
             iouring_queue_depth=self.iouring_queue_depth,
+            max_inflight_read_bytes=self.max_inflight_read_bytes,
+            max_inflight_write_bytes=self.max_inflight_write_bytes,
         )
         if self.use_uring_cmd and self.io_engine != "io_uring":
             raise ValueError("use_uring_cmd requires io_uring as io_engine")
@@ -301,6 +395,18 @@ class RawBlockCore:
             )
 
         self._lock = threading.Lock()
+        # Optional I/O pacing windows shared by every worker thread using
+        # this core.  ``None`` means unrestricted (legacy behavior).
+        self._read_limiter: Optional[BoundedBytesLimiter] = (
+            BoundedBytesLimiter(self.max_inflight_read_bytes)
+            if self.max_inflight_read_bytes > 0
+            else None
+        )
+        self._write_limiter: Optional[BoundedBytesLimiter] = (
+            BoundedBytesLimiter(self.max_inflight_write_bytes)
+            if self.max_inflight_write_bytes > 0
+            else None
+        )
         self._index: dict[str, _Entry] = {}
         self._lock_refcnt: dict[str, int] = {}
         self._inflight: dict[str, _Inflight] = {}
@@ -933,6 +1039,18 @@ class RawBlockCore:
                 "io_engine": self.io_engine,
                 "iouring_queue_depth": self.iouring_queue_depth,
                 "use_uring_cmd": self.use_uring_cmd,
+                "max_inflight_read_bytes": self.max_inflight_read_bytes,
+                "max_inflight_write_bytes": self.max_inflight_write_bytes,
+                "inflight_read_window_bytes": (
+                    self._read_limiter.granted_bytes()
+                    if self._read_limiter is not None
+                    else 0
+                ),
+                "inflight_write_window_bytes": (
+                    self._write_limiter.granted_bytes()
+                    if self._write_limiter is not None
+                    else 0
+                ),
             }
 
     def close(self) -> None:
@@ -1179,12 +1297,16 @@ class RawBlockCore:
 
         if not chunk_offsets:
             return
-        batch_id = raw_dev.batched_write(
-            chunk_offsets,
-            chunk_buffers,
-            chunk_lens,
-        )
-        raw_dev.wait_iouring(batch_id)
+        granted = self._pace(self._write_limiter, sum(chunk_lens))
+        try:
+            batch_id = raw_dev.batched_write(
+                chunk_offsets,
+                chunk_buffers,
+                chunk_lens,
+            )
+            raw_dev.wait_iouring(batch_id)
+        finally:
+            self._unpace(self._write_limiter, granted)
         keepalive.clear()
 
     def _read_uring_cmd_buffers(
@@ -1208,6 +1330,7 @@ class RawBlockCore:
         """
         raw_dev = self._rawdev()
         read_uring = raw_dev.read_uring
+        limiter = self._read_limiter
 
         for offset, buf, payload_len, total_len in zip(
             offsets, buffers, payload_lens, total_lens, strict=True
@@ -1231,12 +1354,16 @@ class RawBlockCore:
             while cursor < total_len:
                 chunk_len = min(self.max_data_transfer_size, total_len - cursor)
                 self._validate_uring_cmd_chunk(offset + cursor, chunk_len)
-                read_uring(
-                    offset + cursor,
-                    target[cursor : cursor + chunk_len],
-                    chunk_len,
-                    chunk_len,
-                )
+                granted = self._pace(limiter, chunk_len)
+                try:
+                    read_uring(
+                        offset + cursor,
+                        target[cursor : cursor + chunk_len],
+                        chunk_len,
+                        chunk_len,
+                    )
+                finally:
+                    self._unpace(limiter, granted)
                 cursor += chunk_len
 
             if copy_back:
@@ -1251,6 +1378,10 @@ class RawBlockCore:
     ) -> None:
         """Write one or more buffers through the configured Rust I/O path.
 
+        Each device write is paced through ``max_inflight_write_bytes`` when
+        that window is configured: per-op for the sequential posix path, and
+        once (summed) for a batched io_uring submission.
+
         Args:
             offsets: Device offsets for each write.
             buffers: Python buffers to write.
@@ -1262,11 +1393,16 @@ class RawBlockCore:
             Exception: Propagates Rust raw-device write errors.
         """
         raw_dev = self._rawdev()
+        limiter = self._write_limiter
         if self.io_engine != "io_uring":
             for offset, buf, payload_len, total_len in zip(
                 offsets, buffers, payload_lens, total_lens, strict=True
             ):
-                raw_dev.pwrite_from_buffer(offset, buf, payload_len, total_len)
+                granted = self._pace(limiter, int(total_len))
+                try:
+                    raw_dev.pwrite_from_buffer(offset, buf, payload_len, total_len)
+                finally:
+                    self._unpace(limiter, granted)
             return
 
         if self.use_uring_cmd:
@@ -1283,18 +1419,60 @@ class RawBlockCore:
             for payload_len, total_len in zip(payload_lens, total_lens, strict=True)
         )
         if can_batch:
-            batch_id = raw_dev.batched_write(
-                [int(offset) for offset in offsets],
-                list(buffers),
-                [int(total_len) for total_len in total_lens],
-            )
-            raw_dev.wait_iouring(batch_id)
+            batch_total = sum(int(total_len) for total_len in total_lens)
+            granted = self._pace(limiter, batch_total)
+            try:
+                batch_id = raw_dev.batched_write(
+                    [int(offset) for offset in offsets],
+                    list(buffers),
+                    [int(total_len) for total_len in total_lens],
+                )
+                raw_dev.wait_iouring(batch_id)
+            finally:
+                self._unpace(limiter, granted)
             return
 
         for offset, buf, payload_len, total_len in zip(
             offsets, buffers, payload_lens, total_lens, strict=True
         ):
-            raw_dev.write_uring(int(offset), buf, int(payload_len), int(total_len))
+            granted = self._pace(limiter, int(total_len))
+            try:
+                raw_dev.write_uring(int(offset), buf, int(payload_len), int(total_len))
+            finally:
+                self._unpace(limiter, granted)
+
+    def _pace(
+        self,
+        limiter: Optional[BoundedBytesLimiter],
+        num_bytes: int,
+    ) -> int:
+        """Acquire pacing window bytes for a device I/O submission.
+
+        Args:
+            limiter: Limiter to acquire from; ``None`` disables pacing and
+                this method returns 0 immediately.
+            num_bytes: Bytes of device I/O about to be submitted.
+
+        Returns:
+            The number of bytes granted (pass verbatim to :meth:`_unpace`).
+        """
+        if limiter is None:
+            return 0
+        return limiter.acquire(num_bytes)
+
+    def _unpace(
+        self,
+        limiter: Optional[BoundedBytesLimiter],
+        granted_bytes: int,
+    ) -> None:
+        """Release pacing window bytes acquired by :meth:`_pace`.
+
+        Args:
+            limiter: Limiter to release to; ``None`` is a no-op.
+            granted_bytes: Value returned by the matching ``_pace`` call.
+        """
+        if limiter is not None and granted_bytes > 0:
+            limiter.release(granted_bytes)
 
     def _read_buffers(
         self,
@@ -1304,6 +1482,10 @@ class RawBlockCore:
         total_lens: Sequence[int],
     ) -> None:
         """Read one or more buffers through the configured Rust I/O path.
+
+        Each device read is paced through ``max_inflight_read_bytes`` when
+        that window is configured: per-op for the sequential posix and
+        uring_cmd paths, and once (summed) for a batched io_uring submission.
 
         Args:
             offsets: Device offsets for each read.
@@ -1316,11 +1498,16 @@ class RawBlockCore:
             Exception: Propagates Rust raw-device read errors.
         """
         raw_dev = self._rawdev()
+        limiter = self._read_limiter
         if self.io_engine != "io_uring":
             for offset, buf, payload_len, total_len in zip(
                 offsets, buffers, payload_lens, total_lens, strict=True
             ):
-                raw_dev.pread_into(offset, buf, payload_len, total_len)
+                granted = self._pace(limiter, int(total_len))
+                try:
+                    raw_dev.pread_into(offset, buf, payload_len, total_len)
+                finally:
+                    self._unpace(limiter, granted)
             return
 
         if self.use_uring_cmd:
@@ -1334,18 +1521,27 @@ class RawBlockCore:
         # batched_read requires aligned buffers when O_DIRECT is enabled
         # Check alignment before using batched_read
         if can_batch and all(self._is_buffer_aligned(buf) for buf in buffers):
-            batch_id = raw_dev.batched_read(
-                [int(offset) for offset in offsets],
-                list(buffers),
-                [int(total_len) for total_len in total_lens],
-            )
-            raw_dev.wait_iouring(batch_id)
+            batch_total = sum(int(total_len) for total_len in total_lens)
+            granted = self._pace(limiter, batch_total)
+            try:
+                batch_id = raw_dev.batched_read(
+                    [int(offset) for offset in offsets],
+                    list(buffers),
+                    [int(total_len) for total_len in total_lens],
+                )
+                raw_dev.wait_iouring(batch_id)
+            finally:
+                self._unpace(limiter, granted)
             return
 
         for offset, buf, payload_len, total_len in zip(
             offsets, buffers, payload_lens, total_lens, strict=True
         ):
-            raw_dev.read_uring(int(offset), buf, int(payload_len), int(total_len))
+            granted = self._pace(limiter, int(total_len))
+            try:
+                raw_dev.read_uring(int(offset), buf, int(payload_len), int(total_len))
+            finally:
+                self._unpace(limiter, granted)
 
     def _write_one(
         self, key: RawBlockKeySpec, memory_obj: MemoryObj, offset: int

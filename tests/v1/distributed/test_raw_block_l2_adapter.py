@@ -204,6 +204,41 @@ def test_raw_block_l2_adapter_config_validates_iouring_queue_depth():
         RawBlockL2AdapterConfig.from_dict(_config_dict(iouring_queue_depth=0))
 
 
+def test_raw_block_l2_adapter_config_pacing_defaults_disabled():
+    config = RawBlockL2AdapterConfig.from_dict(_config_dict())
+
+    assert config.max_inflight_read_bytes == 0
+    assert config.max_inflight_write_bytes == 0
+
+    core_config = config.to_core_config()
+    assert core_config.max_inflight_read_bytes == 0
+    assert core_config.max_inflight_write_bytes == 0
+
+
+def test_raw_block_l2_adapter_config_parses_pacing_windows():
+    config = RawBlockL2AdapterConfig.from_dict(
+        _config_dict(
+            max_inflight_read_bytes=67108864,
+            max_inflight_write_bytes=33554432,
+        )
+    )
+
+    assert config.max_inflight_read_bytes == 67108864
+    assert config.max_inflight_write_bytes == 33554432
+
+    core_config = config.to_core_config()
+    assert core_config.max_inflight_read_bytes == 67108864
+    assert core_config.max_inflight_write_bytes == 33554432
+
+
+@pytest.mark.parametrize(
+    "knob", ["max_inflight_read_bytes", "max_inflight_write_bytes"]
+)
+def test_raw_block_l2_adapter_config_rejects_negative_pacing(knob):
+    with pytest.raises(ValueError, match=knob):
+        RawBlockL2AdapterConfig.from_dict(_config_dict(**{knob: -1}))
+
+
 def _run_store(adapter: RawBlockL2Adapter, keys, objects) -> bool:
     task_id = adapter.submit_store_task(keys, objects)
     assert _wait_event_fd(adapter.get_store_event_fd())
