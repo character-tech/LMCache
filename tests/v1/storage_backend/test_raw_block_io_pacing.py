@@ -24,6 +24,7 @@ from tests.v1.storage_backend.raw_block_test_utils import (
     make_object_key,
     make_raw_block_core_config,
     make_raw_block_file,
+    memory_obj_bytes,
 )
 
 pytest.importorskip("lmcache_rust_raw_block_io")
@@ -194,19 +195,34 @@ def test_pacing_bounds_concurrent_read_bytes(tmp_path):
         specs, payloads = _populate_slots(core, num_slots=8, payload_size=payload)
         assert state["peak"] <= payload, "store path is not read-paced"
 
-        def load_one(spec, size):
+        loaded_objs: list = [None] * len(specs)
+
+        def load_one(idx, spec, size):
             obj = make_empty_memory_obj(size)
             results = core.load_many_into([spec.encoded], [obj])
             assert results == [True]
+            loaded_objs[idx] = obj
 
         before_peak = state["peak"]
-        _spawn_and_wait([lambda s=spec: load_one(s, payload) for spec in specs])
+        _spawn_and_wait(
+            [
+                lambda i=i, s=spec: load_one(i, s, payload)
+                for i, spec in enumerate(specs)
+            ]
+        )
 
         # Without pacing, 8 concurrent threads would read 8x payload bytes
         # concurrently; with the window, peak concurrent reads must stay
         # within one payload.
         assert state["peak"] - before_peak <= payload
         assert state["peak"] > 0
+
+        # Data-integrity check: pacing must never let a concurrent read
+        # observe another read's still-in-flight buffer. Each key was
+        # stored with a distinct byte pattern, so any cross-read
+        # corruption under contention would surface here.
+        for obj, expected in zip(loaded_objs, payloads, strict=True):
+            assert memory_obj_bytes(obj) == expected
     finally:
         core.close()
 
@@ -300,6 +316,16 @@ def test_pacing_bounds_concurrent_write_bytes(tmp_path):
         # concurrent in-flight write bytes within one payload + header.
         assert state["peak"] <= payload + 4096
         assert state["peak"] > 0
+
+        # Data-integrity check: pacing must never let a concurrent write
+        # observe another write's still-in-flight buffer. Read every key
+        # back (sequentially, pacing disengaged) and compare against its
+        # distinct byte pattern.
+        loaded = [make_empty_memory_obj(payload) for _ in specs]
+        load_results = core.load_many_into([spec.encoded for spec in specs], loaded)
+        assert load_results == [True] * len(specs)
+        for obj, expected in zip(loaded, payloads, strict=True):
+            assert memory_obj_bytes(obj) == expected
     finally:
         core.close()
 
