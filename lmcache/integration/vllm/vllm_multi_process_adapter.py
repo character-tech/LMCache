@@ -1680,9 +1680,7 @@ class LMCacheMPWorkerAdapter:
         retrieving_req_ids = set(self.retrieve_futures) | finished_retrieves
         ret_stores = self._process_finished_stores(
             finished_stores,
-            finished_req_ids_from_engine
-            - retrieving_req_ids
-            - self._aborted_retrieves,
+            finished_req_ids_from_engine - retrieving_req_ids - self._aborted_retrieves,
         )
         self._aborted_retrieves.difference_update(finished_req_ids_from_engine)
 
